@@ -86,7 +86,7 @@ tickers = [
     'WEX', 'WY', 'WHR', 'WTM', 'WMB', 'WSM', 'WTW', 'WSC', 'WING', 'WTFC', 'WOLF', 'WWD', 'WDAY', 'WH', 'WYNN', 'XEL', 'XP',
     'XPO', 'XYL', 'YETI', 'YUM', 'ZBRA', 'ZG', 'Z', 'ZBH', 'ZION', 'ZTS', 'ZM', 'ZI', 'ZS'
    ]
-
+tickers = ['AAPL', 'GGG', 'MA', 'V', 'TXG', 'DOCS', 'VOYA', 'XEL', 'TSLA']
 # Function to download data for a single ticker and return the Close prices
 def download_close_prices(ticker):
     """
