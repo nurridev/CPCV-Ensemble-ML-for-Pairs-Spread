@@ -3,14 +3,15 @@ from datetime import datetime, timedelta
 import pandas as pd
 import os
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Dense, Dropout
+from tensorflow.keras.layers import Input, Dense, Dropout, LeakyReLU, BatchNormalization
+from tensorflow.keras.losses import Huber
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.regularizers import l2
+from tensorflow.keras.regularizers import l2, l1_l2
 from tensorflow.keras.callbacks import EarlyStopping
 from sklearn.cluster import HDBSCAN
 import numpy as np
 from itertools import combinations
-from tensorflow.keras.optimizers import AdamW
+from tensorflow.keras.optimizers import Adam
 import pandas as pd
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import coint
@@ -95,15 +96,28 @@ def multi_cointegration_test(
 # AUTOENCODING
 def build_model(output_len):
     model = Sequential([
-        Dense(32, activation='relu', kernel_regularizer=l2(0.01)),
-        Dropout(.2),
-        Dense(16, activation='gelu', kernel_regularizer=l2(0.01)), 
-        Dropout(.1), 
-        Dense(8,activation='gelu', kernel_regularizer=l2(0.01)),
-        Dense(32, activation='relu'), 
-        Dense(output_len,activation='relu') # Output layer
-        ])
-    model.compile(optimizer=AdamW(), loss='mse')
+        # First encoder layer
+        Dense(224, activation='tanh', kernel_regularizer=l1_l2(l1=0.0001461896279370495, l2=0.0028016351587162596)),
+        # Optional batch norm and dropout
+        BatchNormalization(),
+        Dropout(0.14881529393791154),
+        # Second encoder layer (decreased units, using leaky_relu)
+        Dense(int(224 * 0.75)),  # decrease strategy
+        LeakyReLU(),
+        # Latent layer
+        Dense(34, activation='gelu'),
+        # Decoder layer 1
+        Dense(284, activation='gelu'),
+        # Decoder layer 0 batch norm and dropout
+        BatchNormalization(),
+        Dropout(0.2123738038749523),
+        # Output layer
+        Dense(output_len, activation='tanh')
+    ])
+    model.compile(
+        optimizer=Adam(learning_rate=0.018274508859816022),
+        loss=Huber()
+    )
     return model
 def stride_window(stride, lst, window):
     """
