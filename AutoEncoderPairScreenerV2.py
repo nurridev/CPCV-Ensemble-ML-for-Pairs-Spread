@@ -4,7 +4,7 @@ import pandas as pd
 import os
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input, Dense, Dropout, LeakyReLU, BatchNormalization
-from tensorflow.keras.losses import Huber
+from tensorflow.keras.losses import Huber, MSE
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.regularizers import l2, l1_l2
 from tensorflow.keras.callbacks import EarlyStopping
@@ -105,14 +105,14 @@ def build_model(output_len):
         Dense(int(224 * 0.75)),  # decrease strategy
         LeakyReLU(),
         # Latent layer
-        Dense(34, activation='gelu'),
+        Dense(12, activation='gelu'),
         # Decoder layer 1
         Dense(284, activation='gelu'),
         # Decoder layer 0 batch norm and dropout
         BatchNormalization(),
         Dropout(0.2123738038749523),
         # Output layer
-        Dense(output_len, activation='tanh')
+        Dense(output_len, activation='gelu')
     ])
     model.compile(
         optimizer=Adam(learning_rate=0.018274508859816022),
@@ -141,9 +141,9 @@ def stride_window(stride, lst, window):
     if wrap_backwards:
         result.append(lst[-window:])
     return np.array(result)
-def train_autoencoder(LOOKBACK, start, end, alpha, model):
+def train_autoencoder(LOOKBACK, start, end, stride, model):
     """
-    Given start, end dates screens potential pairs
+    Given start, end dates trains based on LOOKBACK rolling window
     Requires 3 * LOOKBACK worth of data 
     - Returns dict: stock_name: vectors 
     """
@@ -163,7 +163,7 @@ def train_autoencoder(LOOKBACK, start, end, alpha, model):
         rolling_std = df_price.rolling(window=LOOKBACK).std()
         rolling_zscore = (df_price - rolling_mean) / rolling_std
         rolling_zscore = rolling_zscore.dropna(how='all').to_list()
-        x = y = stride_window(64, rolling_zscore, LOOKBACK )
+        x = y = stride_window(stride, rolling_zscore, LOOKBACK )
         # Random validation sets
         idx1, idx2, idx3 = random.sample(range(1, len(x) - 2), 3) 
         x_val = y_val = np.array([x[idx1], x[idx2], x[idx3]])
@@ -171,10 +171,10 @@ def train_autoencoder(LOOKBACK, start, end, alpha, model):
         x = y = [x[sample_idx] for sample_idx in range(len(x)) if sample_idx not in [idx1,idx2,idx3]] 
         x, y = np.array(x), np.array(y) 
         early_stop = EarlyStopping(monitor='loss', patience=8, restore_best_weights=True) # earlystop function
-        model.fit(np.array(x), np.array(y) , epochs=1000, validation_data=(x_val, y_val), callbacks=early_stop) # Fit model with earling stopping callback
+        model.fit(np.array(x), np.array(y) , epochs=10000, validation_data=(x_val, y_val), callbacks=early_stop) # Fit model with earling stopping callback
         # Encode newest data
         encoder = Sequential()
-        for i in range(5): #range(n) where n is layer of latent space
+        for i in range(6): #range(n) where n is layer of latent space
             encoder.add(model.layers[i])
         stock_name = ''.join([letter for letter in file_name if letter.isupper()])
         #return model  
@@ -184,17 +184,26 @@ def train_autoencoder(LOOKBACK, start, end, alpha, model):
         vector_universe[stock_name] = stock_vect.tolist()
     return vector_universe, encoder        
 # CLUSTERING
-def cluster(model):
-    
-    cluster_model = HDBSCAN(min_cluster_size=6)
-    data_labels = list(VECTOR_UNIVERSE.keys())
-    vector_data = list(VECTOR_UNIVERSE.values())
-    cluster_set = cluster_model.fit_predict(vector_data).tolist() # Fit and predict cluster algo 
+def cluster_pvals(vector_universe, start_date, end_date, alpha):
+    """
+    -Given vector_universe ->  {'Stock_name':[samples, latent_vector], 'Stock_name':...}
+    -Returns
 
+
+    """ 
+    cluster_model = HDBSCAN(min_cluster_size=6)
+    data_labels = list(vector_universe.keys())
+    vector_data = list(vector_universe.values())
+    flatten_to_2d = lambda data: [[i for sub in ([el] if not isinstance(el, list) else el) for i in (sub if not isinstance(sub, list) else [x for x in sub])] if not isinstance(item, list) else [i for sub in item for i in (sub if not isinstance(sub, list) else [x for x in sub])] for item in data]
+    pad = lambda lst: [x + [0] * (max(map(len, lst)) - len(x)) for x in lst]
+    vector_data = pad(flatten_to_2d(vector_data))
+    cluster_set = cluster_model.fit_predict(vector_data).tolist() # Fit and predict cluster algo 
+     
+     
     VECTOR_CLUSTER = dict(zip(data_labels, cluster_set))
     sorted_clusters = {}
     combo_universe = [] # every combo in each cluster
-# Sort Clusters
+    # Sort Clusters
     for key, value in VECTOR_CLUSTER.items():
         if value not in sorted_clusters.keys():
             sorted_clusters[value] = [key]
@@ -209,37 +218,28 @@ def cluster(model):
                 combo_universe.append(item)
 # Iterate through all pairs
     final_p_vals = {}
+    files = [f for f in os.listdir(DIRECTORY) if os.path.isfile(os.path.join(DIRECTORY, f))]   
     for assets in tqdm(combo_universe) :
         asset_data = {} 
         for name in assets:
             df = pd.read_csv(DIRECTORY + [f for f in files if name in f][0], index_col=0)
+            df = df[start_date:end_date] 
             df.index = pd.to_datetime(df.index) # Sets first column to datetime 
-            target_date = pd.to_datetime(end_date)
-            # Get the nearest index position
-            pos = df.index.get_indexer([target_date], method='nearest')[0]
-
-            # Get the 70 rows before that position
-            df = df.iloc[max(0, pos - LOOKBACK) : pos] 
             asset_data[name] = df.Close.to_list() 
         
         p_val = multi_cointegration_test(asset_data)['p_value']
         final_p_vals[assets] = p_val 
     top_vals = [(item[0], item[1]) for item in final_p_vals.items() if item[1] <= alpha] # ((asset1,asset2), p_val)
     print(top_vals)
-    idx = df_price.index[-1] 
-    return top_vals, idx 
+    return top_vals 
 # FINAL LOOP 
-train_amt = 20
+
 lookback = 256
 start_date = '2014-01-01'
 end_date   = '2020-01-01'
-obj_delimeter = '%Y-%m-%d'
 model = build_model(lookback)
-
-for i in range(train_amt): 
-    end_date = datetime.strptime(end_date, obj_delimeter) 
-    end_date = (end_date + timedelta(days=1)).strftime(obj_delimeter) # Add 1 time step 
-    top_vals, dt = train_autoencoder(lookback, start_date, end_date, .1, model)
-    print(top_vals, dt)
-    open('file.txt', 'a').write(str(top_vals))
+if __name__ == "__main__":
+    
+    vector_universe, encoder = train_autoencoder(lookback, start_date, end_date, 64, model) # autoencodes vector Universe from directory
+    clus = cluster_pvals(vector_universe, start_date, end_date, .1) # Cluster vector universe 
 
