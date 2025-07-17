@@ -169,8 +169,10 @@ def get_vector_universe(encoder, start_date, end_date, stride):
             df = df[start_date:end_date]
             df_price = df['Close']
             
-            if len(df_price) < LOOKBACK + 100:  # Need LOOKBACK for rolling + some extra for processing
-                print(f"⚠️  Skipping {file_name}: insufficient data ({len(df_price)} points)")
+            # Need sufficient data for rolling z-score calculation and window generation
+            min_required = LOOKBACK * 2 + stride  # Rolling calculation + windows + buffer
+            if len(df_price) < min_required:
+                print(f"⚠️  Skipping {file_name}: insufficient data ({len(df_price)} points, need {min_required})")
                 continue
                 
             print(f"📊 Processing {file_name}: {len(df_price)} data points")
@@ -181,16 +183,29 @@ def get_vector_universe(encoder, start_date, end_date, stride):
             rolling_zscore = (df_price - rolling_mean) / rolling_std
             rolling_zscore = rolling_zscore.dropna(how='all').to_list()
             
-            # Create windows
+            # Ensure we have enough data after rolling calculation
+            if len(rolling_zscore) < LOOKBACK + stride:
+                print(f"⚠️  Skipping {file_name}: insufficient z-score data ({len(rolling_zscore)} points)")
+                continue
+            
+            # Create windows - ensure we get exactly LOOKBACK-sized windows
             x = stride_window(stride, rolling_zscore, LOOKBACK)
             
             if len(x) == 0:
+                print(f"⚠️  Skipping {file_name}: no valid windows generated")
+                continue
+            
+            # Verify window dimensions
+            print(f"🔍 Window shape for {file_name}: {x.shape}")
+            if x.shape[1] != LOOKBACK:
+                print(f"❌ Dimension mismatch for {file_name}: expected {LOOKBACK}, got {x.shape[1]}")
                 continue
                 
             # Encode using trained encoder
             stock_vect = encoder.predict(x).squeeze()
             stock_name = ''.join([letter for letter in file_name if letter.isupper()])
             vector_universe[stock_name] = stock_vect.tolist()
+            print(f"✅ Successfully encoded {stock_name}: {len(stock_vect)} features")
             
         except Exception as e:
             print(f"❌ Error processing {file_name}: {e}")
@@ -298,9 +313,9 @@ def calculate_spread_and_ratio(stock1_name, stock2_name, start_date, end_date):
     
     return combined_df, spread, ratio, beta
 
-def create_futuristic_dashboard(top_pairs, start_date, end_date):
+def create_futuristic_dashboard(top_pairs, initial_start_date, initial_end_date):
     """
-    Create an interactive futuristic dashboard
+    Create an interactive futuristic dashboard with date range selectors
     """
     print("🚀 Creating futuristic dashboard...")
     
@@ -339,6 +354,11 @@ def create_futuristic_dashboard(top_pairs, start_date, end_date):
                     border: 1px solid #00ffff !important;
                     color: #00ffff !important;
                 }
+                .date-picker-range {
+                    background-color: rgba(0, 0, 0, 0.8) !important;
+                    border: 1px solid #00ffff !important;
+                    color: #00ffff !important;
+                }
             </style>
         </head>
         <body>
@@ -371,7 +391,33 @@ def create_futuristic_dashboard(top_pairs, start_date, end_date):
             dbc.Col([
                 html.Div([
                     html.H3("⚙️ CONTROL PANEL", className="glow-text"),
-                    html.Label("Select Cointegrated Pair:", className="glow-text"),
+                    
+                    # Screening Date Range
+                    html.Label("📅 Screening Date Range:", className="glow-text mt-3"),
+                    dcc.DatePickerRange(
+                        id='screening-date-range',
+                        start_date=initial_start_date,
+                        end_date=initial_end_date,
+                        display_format='YYYY-MM-DD',
+                        style={'width': '100%', 'color': '#00ffff'}
+                    ),
+                    
+                    html.Br(),
+                    dbc.Button("🔍 Re-screen Pairs", id="rescreen-button", 
+                              color="info", outline=True, className="mt-2 mb-3"),
+                    
+                    # Graphing Date Range
+                    html.Label("📊 Graphing Date Range:", className="glow-text mt-3"),
+                    dcc.DatePickerRange(
+                        id='graphing-date-range',
+                        start_date=initial_start_date,
+                        end_date=initial_end_date,
+                        display_format='YYYY-MM-DD',
+                        style={'width': '100%', 'color': '#00ffff'}
+                    ),
+                    
+                    html.Br(),
+                    html.Label("Select Cointegrated Pair:", className="glow-text mt-3"),
                     dcc.Dropdown(
                         id='pair-selector',
                         options=pair_options,
@@ -420,25 +466,64 @@ def create_futuristic_dashboard(top_pairs, start_date, end_date):
                     html.Div(id='stats-display')
                 ], className="futuristic-container")
             ], width=12)
-        ])
+        ]),
+        
+        # Hidden div to store current pairs data
+        html.Div(id='pairs-data', style={'display': 'none'})
     ], fluid=True)
+    
+    @app.callback(
+        [Output('pairs-data', 'children'),
+         Output('pair-selector', 'options'),
+         Output('pair-selector', 'value')],
+        [Input('rescreen-button', 'n_clicks')],
+        [dash.dependencies.State('screening-date-range', 'start_date'),
+         dash.dependencies.State('screening-date-range', 'end_date')]
+    )
+    def rescreen_pairs(n_clicks, start_date, end_date):
+        if n_clicks and start_date and end_date:
+            print(f"🔄 Re-screening pairs for period {start_date} to {end_date}")
+            
+            # Load encoder
+            encoder = load_encoder()
+            if encoder is None:
+                return str(top_pairs), pair_options, pair_options[0]['value'] if pair_options else None
+            
+            # Re-screen with new dates
+            new_pairs = screen_stocks(encoder, start_date, end_date, alpha=0.05)
+            
+            if new_pairs:
+                new_pair_options = [
+                    {'label': f"{pair[0][0]} - {pair[0][1]} (p-val: {pair[1]:.4f})", 'value': f"{pair[0][0]}|{pair[0][1]}"}
+                    for pair in new_pairs[:10]
+                ]
+                return str(new_pairs), new_pair_options, new_pair_options[0]['value']
+        
+        return str(top_pairs), pair_options, pair_options[0]['value'] if pair_options else None
     
     @app.callback(
         [Output('main-chart', 'figure'),
          Output('stats-display', 'children')],
         [Input('pair-selector', 'value'),
          Input('display-options', 'value'),
-         Input('background-selector', 'value')]
+         Input('background-selector', 'value'),
+         Input('graphing-date-range', 'start_date'),
+         Input('graphing-date-range', 'end_date'),
+         Input('pairs-data', 'children')]
     )
-    def update_dashboard(selected_pair, display_options, background_style):
-        if not selected_pair:
-            return {}, "No pair selected"
+    def update_dashboard(selected_pair, display_options, background_style, graph_start, graph_end, pairs_data):
+        if not selected_pair or not graph_start or not graph_end:
+            return {}, "No pair selected or invalid date range"
         
         stock1, stock2 = selected_pair.split('|')
         
         try:
-            # Calculate spread and ratio
-            combined_df, spread, ratio, beta = calculate_spread_and_ratio(stock1, stock2, start_date, end_date)
+            # Calculate spread and ratio for graphing period
+            combined_df, spread, ratio, beta = calculate_spread_and_ratio(stock1, stock2, graph_start, graph_end)
+            
+            # Calculate p-value for the graphing period
+            asset_data = {stock1: combined_df[stock1].tolist(), stock2: combined_df[stock2].tolist()}
+            current_p_val = multi_cointegration_test(asset_data)['p_value']
             
             # Background styles
             bg_styles = {
@@ -502,7 +587,7 @@ def create_futuristic_dashboard(top_pairs, start_date, end_date):
             # Update layout with futuristic styling
             fig.update_layout(
                 title=dict(
-                    text=f"<b>🎯 {stock1} vs {stock2} ANALYSIS</b>",
+                    text=f"<b>🎯 {stock1} vs {stock2} ANALYSIS | P-VAL: {current_p_val:.6f}</b>",
                     font=dict(color='#00ffff', size=20),
                     x=0.5
                 ),
@@ -543,7 +628,12 @@ def create_futuristic_dashboard(top_pairs, start_date, end_date):
                 )
             
             # Statistics display
-            p_val = next((pair[1] for pair in top_pairs if f"{pair[0][0]}|{pair[0][1]}" == selected_pair), None)
+            screening_p_val = None
+            try:
+                current_pairs = eval(pairs_data) if pairs_data else top_pairs
+                screening_p_val = next((pair[1] for pair in current_pairs if f"{pair[0][0]}|{pair[0][1]}" == selected_pair), None)
+            except:
+                screening_p_val = None
             
             stats = html.Div([
                 dbc.Row([
@@ -551,9 +641,11 @@ def create_futuristic_dashboard(top_pairs, start_date, end_date):
                         html.P(f"📈 Stock 1: {stock1}", className="glow-text"),
                         html.P(f"📉 Stock 2: {stock2}", className="glow-text"),
                         html.P(f"🔢 Beta: {beta:.4f}", className="glow-text"),
+                        html.P(f"📅 Graph Period: {graph_start} to {graph_end}", className="glow-text"),
                     ], width=4),
                     dbc.Col([
-                        html.P(f"📊 P-Value: {p_val:.6f}", className="glow-text"),
+                        html.P(f"🎯 Current P-Value: {current_p_val:.6f}", className="glow-text"),
+                        html.P(f"📊 Screening P-Value: {screening_p_val:.6f}" if screening_p_val else "📊 Screening P-Value: N/A", className="glow-text"),
                         html.P(f"📏 Spread Mean: {spread.mean():.4f}", className="glow-text"),
                         html.P(f"📐 Spread Std: {spread.std():.4f}", className="glow-text"),
                     ], width=4),
@@ -561,6 +653,7 @@ def create_futuristic_dashboard(top_pairs, start_date, end_date):
                         html.P(f"⚖️ Ratio Mean: {ratio.mean():.4f}", className="glow-text"),
                         html.P(f"📊 Ratio Std: {ratio.std():.4f}", className="glow-text"),
                         html.P(f"📅 Data Points: {len(combined_df)}", className="glow-text"),
+                        html.P(f"🔍 Cointegrated: {'✅ YES' if current_p_val < 0.05 else '❌ NO'}", className="glow-text"),
                     ], width=4)
                 ])
             ])
@@ -590,13 +683,14 @@ def main():
     if encoder is None:
         return
     
-    # Configuration - Using smaller date range to work with available data
-    start_date = '2020-01-01'  # Smaller window to ensure sufficient data
-    end_date = '2022-01-01'    # 2 years of data should be enough
+    # Configuration - Using wider date range to ensure sufficient data for 256-dimensional windows
+    start_date = '2019-01-01'  # Wider window to ensure sufficient data for LOOKBACK=256
+    end_date = '2021-12-31'    # Longer period to get more data points
     alpha = 0.05
     
     print(f"⏰ Screening period: {start_date} to {end_date}")
     print(f"🎯 Alpha threshold: {alpha}")
+    print(f"🔧 Expected input dimension: {LOOKBACK}")
     
     # Screen for cointegrated pairs
     top_pairs = screen_stocks(encoder, start_date, end_date, alpha=alpha)
@@ -617,7 +711,8 @@ def main():
     print("📡 Access at: http://127.0.0.1:8050")
     print("🛑 Press Ctrl+C to stop")
     
-    app.run_server(debug=True, host='127.0.0.1', port=8050)
+    # Fixed: Use app.run() instead of app.run_server()
+    app.run(debug=True, host='127.0.0.1', port=8050)
 
 if __name__ == "__main__":
     main() 
