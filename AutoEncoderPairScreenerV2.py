@@ -1,3 +1,4 @@
+import pickle
 import random 
 from datetime import datetime, timedelta
 import pandas as pd
@@ -241,5 +242,7 @@ model = build_model(lookback)
 if __name__ == "__main__":
     
     vector_universe, encoder = train_autoencoder(lookback, start_date, end_date, 64, model) # autoencodes vector Universe from directory
+    with open("encoder.pkl", "wb") as f:
+        pickle.dump(encoder, f) 
     clus = cluster_pvals(vector_universe, start_date, end_date, .1) # Cluster vector universe 
 

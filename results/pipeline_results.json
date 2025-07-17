@@ -1,0 +1,26 @@
+{
+  "config": {
+    "data_directory": "./stock_data/",
+    "output_directory": "./results/",
+    "lookback_window": 256,
+    "stride": 64,
+    "latent_dim": 12,
+    "max_epochs": 1000,
+    "patience": 8,
+    "batch_size": 32,
+    "learning_rate": 0.018274508859816022,
+    "min_cluster_size": 6,
+    "significance_level": 0.1,
+    "min_data_points": 3,
+    "start_date": "2014-01-01",
+    "end_date": "2020-01-01",
+    "test_start_date": "2020-01-01",
+    "test_end_date": "2023-01-01",
+    "create_dashboard": true,
+    "max_pairs_to_model": 15
+  },
+  "significant_pairs": [],
+  "n_stocks_processed": 13,
+  "n_significant_pairs": 0,
+  "execution_time": "0:00:19.620721"
+}

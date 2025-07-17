@@ -30,9 +30,9 @@ PRICE_RPM       = int(os.getenv("ALPHAVANTAGE_RPM", "5"))
 API_KEY_FUND    = os.getenv("ALPHAVANTAGE_FUND_KEY", API_KEY_PRICE)
 FUND_RPM        = int(os.getenv("ALPHAVANTAGE_FUND_RPM", str(PRICE_RPM)))
 
-START_DATE      = os.getenv("START_DATE", "2010-01-01")
+START_DATE      = os.getenv("START_DATE", "2022-12-01")
 END_DATE        = os.getenv("END_DATE", "2023-01-01")
-GRANULARITY     = os.getenv("GRANULARITY", "daily")  # daily / weekly / monthly / 1min / 5min / …
+GRANULARITY     = os.getenv("GRANULARITY", "5min")  # daily / weekly / monthly / 1min / 5min / …
 
 DOWNLOAD_FUND   = bool(int(os.getenv("ALPHAVANTAGE_FUNDAMENTALS", "1")))
 SAVE_COMBINED   = bool(int(os.getenv("SAVE_COMBINED", "0")))  # optional: all tickers → one wide CSV
@@ -104,7 +104,6 @@ TICKERS: List[str] = [
     'WEX', 'WY', 'WHR', 'WTM', 'WMB', 'WSM', 'WTW', 'WSC', 'WING', 'WTFC', 'WOLF', 'WWD', 'WDAY', 'WH', 'WYNN', 'XEL', 'XP',
     'XPO', 'XYL', 'YETI', 'YUM', 'ZBRA', 'ZG', 'Z', 'ZBH', 'ZION', 'ZTS', 'ZM', 'ZI', 'ZS'
    ]
-
 OUT_DIR = Path("stock_data")
 OUT_DIR.mkdir(exist_ok=True)
 # ───────────────────────────────────────
