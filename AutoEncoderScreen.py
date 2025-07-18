@@ -499,7 +499,8 @@ def cluster_pvals_multithreaded(vector_universe, start_date, end_date, n_stocks,
     
     # Show results breakdown by cluster
     if all_results:
-        print(f"\n🏆 COINTEGRATED {n_stocks.upper()}-TUPLES BY CLUSTER:")
+        tuple_type_name = "PAIRS" if n_stocks == 2 else f"{n_stocks}-TUPLES"
+        print(f"\n🏆 COINTEGRATED {tuple_type_name} BY CLUSTER:")
         cluster_results_count = {}
         for result in all_results:
             # Find which cluster this result belongs to
