@@ -18,6 +18,9 @@ import plotly.express as px
 import dash
 from dash import dcc, html, Input, Output, callback
 import dash_bootstrap_components as dbc
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from functools import partial
 
 # Configuration
 DIRECTORY = 'stock_data/Data/'
@@ -123,6 +126,47 @@ def multi_cointegration_test(
         'cointegration_rank': rank
     }
 
+def process_single_cluster(cluster_id, stock_list, start_date, end_date, n_stocks, alpha, files):
+    """
+    Process a single cluster to find cointegrated N-tuples
+    This function is designed to be run in parallel
+    """
+    cluster_results = []
+    
+    if len(stock_list) < n_stocks:
+        return cluster_results
+    
+    # Generate combinations within this cluster only
+    cluster_combos = list(combinations(stock_list, n_stocks))
+    
+    print(f"🔍 Cluster {cluster_id}: Testing {len(cluster_combos)} {n_stocks}-tuples")
+    
+    # Test cointegration for combinations in this cluster
+    for assets in cluster_combos:
+        try:
+            asset_data = {}
+            for name in assets:
+                matching_files = [f for f in files if name in f]
+                if not matching_files:
+                    continue
+                    
+                df = pd.read_csv(DIRECTORY + matching_files[0], index_col=0)
+                df = df[start_date:end_date]
+                df.index = pd.to_datetime(df.index)
+                asset_data[name] = df.Close.to_list()
+            
+            if len(asset_data) == n_stocks:
+                p_val = multi_cointegration_test(asset_data)['p_value']
+                if p_val <= alpha:  # Only keep results that pass alpha threshold
+                    cluster_results.append((assets, p_val))
+                    
+        except Exception as e:
+            # Silently continue on errors to avoid cluttering output
+            continue
+    
+    print(f"✅ Cluster {cluster_id}: Found {len(cluster_results)} cointegrated {n_stocks}-tuples")
+    return cluster_results
+
 def stride_window(stride, lst, window):
     """
     stride: distance between each window
@@ -175,8 +219,8 @@ def screen_stocks(encoder, start_date, end_date, n_stocks=2, stride=64, alpha=0.
     
     print(f"📈 Found {len(vector_universe)} valid stocks for screening")
     
-    # Find cointegrated tuples using clustering
-    cointegrated_tuples = cluster_pvals(vector_universe, start_date, end_date, n_stocks, alpha)
+    # Find cointegrated tuples using clustering (now multithreaded)
+    cointegrated_tuples = cluster_pvals_multithreaded(vector_universe, start_date, end_date, n_stocks, alpha)
     
     if not cointegrated_tuples:
         print(f"❌ No cointegrated {n_stocks}-tuples found with alpha = {alpha}")
@@ -246,11 +290,12 @@ def get_vector_universe(encoder, start_date, end_date, stride):
     
     return vector_universe
 
-def cluster_pvals(vector_universe, start_date, end_date, n_stocks, alpha):
+def cluster_pvals_multithreaded(vector_universe, start_date, end_date, n_stocks, alpha, max_workers=4):
     """
-    Cluster stocks and find cointegrated N-tuples
+    Cluster stocks and find cointegrated N-tuples using multithreading
+    Only tests cointegration WITHIN each cluster (not across clusters)
     """
-    print(f"🔬 Clustering stocks and testing {n_stocks}-tuple cointegration...")
+    print(f"🔬 Clustering stocks and testing {n_stocks}-tuple cointegration (multithreaded)...")
     
     cluster_model = HDBSCAN(min_cluster_size=max(6, n_stocks + 1))
     data_labels = list(vector_universe.keys())
@@ -266,49 +311,59 @@ def cluster_pvals(vector_universe, start_date, end_date, n_stocks, alpha):
     
     # Sort clusters
     sorted_clusters = {}
-    combo_universe = []
-    
     for key, value in VECTOR_CLUSTER.items():
         if value not in sorted_clusters.keys():
             sorted_clusters[value] = [key]
         else:
             sorted_clusters[value].append(key)
     
-    for key, lst in sorted_clusters.items():
-        if len(lst) >= n_stocks:
-            combos = list(combinations(lst, n_stocks))
-            combo_universe.extend(combos)
+    # Filter clusters that have enough stocks for N-tuples
+    valid_clusters = {k: v for k, v in sorted_clusters.items() 
+                     if len(v) >= n_stocks and k != -1}  # Exclude noise cluster (-1)
     
-    print(f"🔍 Testing {len(combo_universe)} potential {n_stocks}-tuples for cointegration...")
+    print(f"📊 Found {len(valid_clusters)} valid clusters for {n_stocks}-tuple analysis")
     
-    # Test cointegration for all tuples
-    final_p_vals = {}
+    # Calculate total combinations across all clusters
+    total_combos = sum(len(list(combinations(stocks, n_stocks))) 
+                      for stocks in valid_clusters.values())
+    print(f"🔍 Total combinations to test: {total_combos}")
+    
+    # Prepare file list once
     files = [f for f in os.listdir(DIRECTORY) if os.path.isfile(os.path.join(DIRECTORY, f))]
     
-    for assets in tqdm(combo_universe, desc=f"Testing {n_stocks}-tuple cointegration"):
-        try:
-            asset_data = {}
-            for name in assets:
-                matching_files = [f for f in files if name in f]
-                if not matching_files:
-                    continue
-                    
-                df = pd.read_csv(DIRECTORY + matching_files[0], index_col=0)
-                df = df[start_date:end_date]
-                df.index = pd.to_datetime(df.index)
-                asset_data[name] = df.Close.to_list()
-            
-            if len(asset_data) == n_stocks:
-                p_val = multi_cointegration_test(asset_data)['p_value']
-                final_p_vals[assets] = p_val
-                
-        except Exception as e:
-            print(f"❌ Error testing {assets}: {e}")
-            continue
+    # Process clusters in parallel
+    all_results = []
     
-    # Filter by alpha
-    top_vals = [(item[0], item[1]) for item in final_p_vals.items() if item[1] <= alpha]
-    return top_vals
+    print(f"🚀 Starting multithreaded processing with {max_workers} workers...")
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Create a partial function with common parameters
+        process_cluster = partial(process_single_cluster, 
+                                start_date=start_date, 
+                                end_date=end_date, 
+                                n_stocks=n_stocks, 
+                                alpha=alpha, 
+                                files=files)
+        
+        # Submit all cluster processing tasks
+        future_to_cluster = {
+            executor.submit(process_cluster, cluster_id, stock_list): cluster_id
+            for cluster_id, stock_list in valid_clusters.items()
+        }
+        
+        # Collect results as they complete
+        for future in as_completed(future_to_cluster):
+            cluster_id = future_to_cluster[future]
+            try:
+                cluster_results = future.result()
+                all_results.extend(cluster_results)
+            except Exception as e:
+                print(f"❌ Error processing cluster {cluster_id}: {e}")
+    
+    print(f"✅ Multithreaded processing complete!")
+    print(f"🎯 Found {len(all_results)} total cointegrated {n_stocks}-tuples across all clusters")
+    
+    return all_results
 
 def calculate_spread(stock_tuple, start_date, end_date):
     """
@@ -615,7 +670,7 @@ def create_modern_dashboard(top_tuples, initial_start_date, initial_end_date, n_
             if encoder is None:
                 return str(top_tuples), tuple_options, tuple_options[0]['value'] if tuple_options else None
             
-            # Re-screen with new dates
+            # Re-screen with new dates using multithreaded approach
             new_tuples = screen_stocks(encoder, start_date, end_date, n_stocks=n_stocks, alpha=0.05)
             
             if new_tuples:
@@ -657,25 +712,25 @@ def create_modern_dashboard(top_tuples, initial_start_date, initial_end_date, n_
                 'modern_dark': {
                     'plot_bgcolor': '#0f172a',
                     'paper_bgcolor': 'rgba(0,0,0,0)',
-                    'gridcolor': 'rgba(59, 130, 246, 0.1)',
+                    'axis_color': 'rgba(59, 130, 246, 0.1)',
                     'colors': ['#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6']
                 },
                 'sleek_blue': {
                     'plot_bgcolor': '#1e293b',
                     'paper_bgcolor': 'rgba(30, 41, 59, 0.8)',
-                    'gridcolor': 'rgba(59, 130, 246, 0.2)',
+                    'axis_color': 'rgba(59, 130, 246, 0.2)',
                     'colors': ['#60a5fa', '#34d399', '#fbbf24', '#f87171', '#a78bfa']
                 },
                 'minimal': {
                     'plot_bgcolor': '#f8fafc',
                     'paper_bgcolor': 'rgba(248, 250, 252, 0.9)',
-                    'gridcolor': 'rgba(148, 163, 184, 0.3)',
+                    'axis_color': 'rgba(148, 163, 184, 0.3)',
                     'colors': ['#1e40af', '#dc2626', '#059669', '#d97706', '#7c3aed']
                 },
                 'professional': {
                     'plot_bgcolor': '#111827',
                     'paper_bgcolor': 'rgba(17, 24, 39, 0.95)',
-                    'gridcolor': 'rgba(75, 85, 99, 0.3)',
+                    'axis_color': 'rgba(75, 85, 99, 0.3)',
                     'colors': ['#2563eb', '#dc2626', '#059669', '#d97706', '#7c3aed']
                 }
             }
@@ -748,12 +803,12 @@ def create_modern_dashboard(top_tuples, initial_start_date, initial_end_date, n_
                     font=dict(color='var(--text-primary)')
                 ),
                 xaxis=dict(
-                    gridcolor=current_theme['gridcolor'],
+                    gridcolor=current_theme['axis_color'],
                     color='var(--text-primary)',
                     showgrid=True
                 ),
                 yaxis=dict(
-                    gridcolor=current_theme['gridcolor'],
+                    gridcolor=current_theme['axis_color'],
                     color='var(--text-primary)',
                     showgrid=True
                 ),
@@ -763,13 +818,13 @@ def create_modern_dashboard(top_tuples, initial_start_date, initial_end_date, n_
             # Update all subplot axes
             for i in range(1, subplot_count + 1):
                 fig.update_xaxes(
-                    gridcolor=current_theme['gridcolor'],
+                    gridcolor=current_theme['axis_color'],
                     color='var(--text-primary)',
                     showgrid=True,
                     row=i, col=1
                 )
                 fig.update_yaxes(
-                    gridcolor=current_theme['gridcolor'],
+                    gridcolor=current_theme['axis_color'],
                     color='var(--text-primary)',
                     showgrid=True,
                     row=i, col=1
