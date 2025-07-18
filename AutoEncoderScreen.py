@@ -24,6 +24,39 @@ DIRECTORY = 'stock_data/Data/'
 LOOKBACK = 256  # Must match training lookback
 ENCODER_PATH = "encoder.pkl"
 
+def get_user_preferences():
+    """
+    Get user preferences for number of stocks per group
+    """
+    print("\n" + "="*60)
+    print("🚀 AUTOENCODER PAIRS/TRIPLETS SCREENER CONFIGURATION")
+    print("="*60)
+    
+    while True:
+        try:
+            n_stocks = int(input("\n📊 How many stocks per group do you want to analyze?\n"
+                                "   2 = Pairs trading\n"
+                                "   3 = Triplets trading\n"
+                                "   4+ = N-tuple trading\n"
+                                "Enter number (2-10): "))
+            
+            if 2 <= n_stocks <= 10:
+                break
+            else:
+                print("❌ Please enter a number between 2 and 10")
+        except ValueError:
+            print("❌ Please enter a valid number")
+    
+    print(f"\n✅ Selected: {n_stocks}-tuple trading")
+    if n_stocks == 2:
+        print("📈 You'll be analyzing stock pairs")
+    elif n_stocks == 3:
+        print("📈 You'll be analyzing stock triplets")
+    else:
+        print(f"📈 You'll be analyzing {n_stocks}-stock combinations")
+    
+    return n_stocks
+
 def multi_cointegration_test(
     data_dict,
     det_order=0,
@@ -126,11 +159,11 @@ def load_encoder():
         print(f"❌ Error loading encoder: {e}")
         return None
 
-def screen_stocks(encoder, start_date, end_date, stride=64, alpha=0.05):
+def screen_stocks(encoder, start_date, end_date, n_stocks=2, stride=64, alpha=0.05):
     """
     Screen stocks using the trained encoder and same preprocessing pipeline
     """
-    print(f"🔍 Screening stocks from {start_date} to {end_date}")
+    print(f"🔍 Screening {n_stocks}-tuples from {start_date} to {end_date}")
     print(f"📊 Using alpha = {alpha} for cointegration test")
     
     # Get vector universe using trained encoder
@@ -142,19 +175,19 @@ def screen_stocks(encoder, start_date, end_date, stride=64, alpha=0.05):
     
     print(f"📈 Found {len(vector_universe)} valid stocks for screening")
     
-    # Find cointegrated pairs using clustering
-    cointegrated_pairs = cluster_pvals(vector_universe, start_date, end_date, alpha)
+    # Find cointegrated tuples using clustering
+    cointegrated_tuples = cluster_pvals(vector_universe, start_date, end_date, n_stocks, alpha)
     
-    if not cointegrated_pairs:
-        print(f"❌ No cointegrated pairs found with alpha = {alpha}")
+    if not cointegrated_tuples:
+        print(f"❌ No cointegrated {n_stocks}-tuples found with alpha = {alpha}")
         return []
     
-    print(f"✅ Found {len(cointegrated_pairs)} cointegrated pairs")
+    print(f"✅ Found {len(cointegrated_tuples)} cointegrated {n_stocks}-tuples")
     
     # Sort by p-value and take top 10
-    sorted_pairs = sorted(cointegrated_pairs, key=lambda x: x[1])[:10]
+    sorted_tuples = sorted(cointegrated_tuples, key=lambda x: x[1])[:10]
     
-    return sorted_pairs
+    return sorted_tuples
 
 def get_vector_universe(encoder, start_date, end_date, stride):
     """
@@ -213,13 +246,13 @@ def get_vector_universe(encoder, start_date, end_date, stride):
     
     return vector_universe
 
-def cluster_pvals(vector_universe, start_date, end_date, alpha):
+def cluster_pvals(vector_universe, start_date, end_date, n_stocks, alpha):
     """
-    Cluster stocks and find cointegrated pairs
+    Cluster stocks and find cointegrated N-tuples
     """
-    print("🔬 Clustering stocks and testing cointegration...")
+    print(f"🔬 Clustering stocks and testing {n_stocks}-tuple cointegration...")
     
-    cluster_model = HDBSCAN(min_cluster_size=6)
+    cluster_model = HDBSCAN(min_cluster_size=max(6, n_stocks + 1))
     data_labels = list(vector_universe.keys())
     vector_data = list(vector_universe.values())
     
@@ -242,17 +275,17 @@ def cluster_pvals(vector_universe, start_date, end_date, alpha):
             sorted_clusters[value].append(key)
     
     for key, lst in sorted_clusters.items():
-        if len(lst) >= 2:
-            combos = list(combinations(lst, 2))
+        if len(lst) >= n_stocks:
+            combos = list(combinations(lst, n_stocks))
             combo_universe.extend(combos)
     
-    print(f"🔍 Testing {len(combo_universe)} potential pairs for cointegration...")
+    print(f"🔍 Testing {len(combo_universe)} potential {n_stocks}-tuples for cointegration...")
     
-    # Test cointegration for all pairs
+    # Test cointegration for all tuples
     final_p_vals = {}
     files = [f for f in os.listdir(DIRECTORY) if os.path.isfile(os.path.join(DIRECTORY, f))]
     
-    for assets in tqdm(combo_universe, desc="Testing cointegration"):
+    for assets in tqdm(combo_universe, desc=f"Testing {n_stocks}-tuple cointegration"):
         try:
             asset_data = {}
             for name in assets:
@@ -265,7 +298,7 @@ def cluster_pvals(vector_universe, start_date, end_date, alpha):
                 df.index = pd.to_datetime(df.index)
                 asset_data[name] = df.Close.to_list()
             
-            if len(asset_data) == 2:
+            if len(asset_data) == n_stocks:
                 p_val = multi_cointegration_test(asset_data)['p_value']
                 final_p_vals[assets] = p_val
                 
@@ -277,52 +310,62 @@ def cluster_pvals(vector_universe, start_date, end_date, alpha):
     top_vals = [(item[0], item[1]) for item in final_p_vals.items() if item[1] <= alpha]
     return top_vals
 
-def calculate_spread_and_ratio(stock1_name, stock2_name, start_date, end_date):
+def calculate_spread(stock_tuple, start_date, end_date):
     """
-    Calculate spread and ratio for a stock pair
+    Calculate spread for an N-tuple of stocks using multiple regression
     """
     files = [f for f in os.listdir(DIRECTORY) if os.path.isfile(os.path.join(DIRECTORY, f))]
     
-    # Load data for both stocks
-    stock1_file = [f for f in files if stock1_name in f][0]
-    stock2_file = [f for f in files if stock2_name in f][0]
+    # Load data for all stocks in tuple
+    stock_data = {}
+    for stock_name in stock_tuple:
+        stock_file = [f for f in files if stock_name in f][0]
+        df = pd.read_csv(DIRECTORY + stock_file, index_col=0)
+        df = df[start_date:end_date]
+        df.index = pd.to_datetime(df.index)
+        stock_data[stock_name] = df['Close']
     
-    df1 = pd.read_csv(DIRECTORY + stock1_file, index_col=0)
-    df2 = pd.read_csv(DIRECTORY + stock2_file, index_col=0)
+    # Align all dataframes
+    combined_df = pd.concat(stock_data, axis=1).dropna()
     
-    df1 = df1[start_date:end_date]
-    df2 = df2[start_date:end_date]
+    if len(stock_tuple) == 2:
+        # Simple pair case
+        stock1, stock2 = stock_tuple
+        X = combined_df[stock2].values.reshape(-1, 1)
+        y = combined_df[stock1].values
+        reg = LinearRegression().fit(X, y)
+        beta = reg.coef_[0]
+        spread = combined_df[stock1] - beta * combined_df[stock2]
+        coefficients = {stock1: 1.0, stock2: -beta}
+    else:
+        # Multiple regression for N-tuple
+        dependent_stock = stock_tuple[0]  # First stock as dependent variable
+        independent_stocks = stock_tuple[1:]  # Rest as independent variables
+        
+        X = combined_df[independent_stocks].values
+        y = combined_df[dependent_stock].values
+        reg = LinearRegression().fit(X, y)
+        
+        # Calculate spread: stock1 - β1*stock2 - β2*stock3 - ...
+        spread = combined_df[dependent_stock].copy()
+        coefficients = {dependent_stock: 1.0}
+        
+        for i, stock in enumerate(independent_stocks):
+            spread -= reg.coef_[i] * combined_df[stock]
+            coefficients[stock] = -reg.coef_[i]
     
-    df1.index = pd.to_datetime(df1.index)
-    df2.index = pd.to_datetime(df2.index)
-    
-    # Align dataframes
-    combined_df = pd.concat([df1['Close'], df2['Close']], axis=1, keys=[stock1_name, stock2_name]).dropna()
-    
-    # Calculate beta using linear regression
-    X = combined_df[stock2_name].values.reshape(-1, 1)
-    y = combined_df[stock1_name].values
-    reg = LinearRegression().fit(X, y)
-    beta = reg.coef_[0]
-    
-    # Calculate spread: stock1 - beta * stock2
-    spread = combined_df[stock1_name] - beta * combined_df[stock2_name]
-    
-    # Calculate ratio: stock1 / stock2
-    ratio = combined_df[stock1_name] / combined_df[stock2_name]
-    
-    return combined_df, spread, ratio, beta
+    return combined_df, spread, coefficients
 
-def create_futuristic_dashboard(top_pairs, initial_start_date, initial_end_date):
+def create_modern_dashboard(top_tuples, initial_start_date, initial_end_date, n_stocks):
     """
-    Create an interactive futuristic dashboard with date range selectors
+    Create a modern, sleek interactive dashboard
     """
-    print("🚀 Creating futuristic dashboard...")
+    print("🚀 Creating modern dashboard...")
     
-    # Initialize Dash app with dark theme
-    app = dash.Dash(__name__, external_stylesheets=[dbc.themes.CYBORG])
+    # Initialize Dash app with modern theme
+    app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
     
-    # Custom CSS for futuristic look
+    # Modern sleek CSS
     app.index_string = '''
     <!DOCTYPE html>
     <html>
@@ -331,33 +374,106 @@ def create_futuristic_dashboard(top_pairs, initial_start_date, initial_end_date)
             <title>{%title%}</title>
             {%favicon%}
             {%css%}
+            <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
             <style>
+                :root {
+                    --primary-color: #2563eb;
+                    --secondary-color: #1e40af;
+                    --accent-color: #3b82f6;
+                    --success-color: #10b981;
+                    --warning-color: #f59e0b;
+                    --danger-color: #ef4444;
+                    --dark-bg: #0f172a;
+                    --card-bg: #1e293b;
+                    --border-color: #334155;
+                    --text-primary: #f8fafc;
+                    --text-secondary: #cbd5e1;
+                    --shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+                }
+                
                 body {
-                    background: linear-gradient(135deg, #0c0c0c 0%, #1a1a2e 50%, #16213e 100%);
-                    font-family: 'Orbitron', monospace;
-                    color: #00ffff;
+                    background: linear-gradient(135deg, var(--dark-bg) 0%, #1a202c 100%);
+                    font-family: 'Inter', sans-serif;
+                    color: var(--text-primary);
+                    margin: 0;
+                    min-height: 100vh;
                 }
-                .futuristic-container {
-                    border: 2px solid #00ffff;
-                    border-radius: 15px;
-                    background: rgba(0, 255, 255, 0.1);
-                    backdrop-filter: blur(10px);
-                    box-shadow: 0 0 20px rgba(0, 255, 255, 0.3);
-                    margin: 10px;
-                    padding: 20px;
+                
+                .modern-card {
+                    background: var(--card-bg);
+                    border-radius: 16px;
+                    border: 1px solid var(--border-color);
+                    box-shadow: var(--shadow);
+                    backdrop-filter: blur(16px);
+                    margin: 16px;
+                    padding: 24px;
+                    transition: transform 0.2s ease, box-shadow 0.2s ease;
                 }
-                .glow-text {
-                    text-shadow: 0 0 10px #00ffff, 0 0 20px #00ffff, 0 0 30px #00ffff;
+                
+                .modern-card:hover {
+                    transform: translateY(-2px);
+                    box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
                 }
-                .dropdown-style {
-                    background-color: rgba(0, 0, 0, 0.8) !important;
-                    border: 1px solid #00ffff !important;
-                    color: #00ffff !important;
+                
+                .gradient-text {
+                    background: linear-gradient(135deg, var(--primary-color), var(--accent-color));
+                    -webkit-background-clip: text;
+                    -webkit-text-fill-color: transparent;
+                    background-clip: text;
+                    font-weight: 700;
                 }
-                .date-picker-range {
-                    background-color: rgba(0, 0, 0, 0.8) !important;
-                    border: 1px solid #00ffff !important;
-                    color: #00ffff !important;
+                
+                .control-panel {
+                    background: linear-gradient(135deg, var(--card-bg), #2d3748);
+                }
+                
+                .stats-grid {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                    gap: 16px;
+                }
+                
+                .stat-item {
+                    background: rgba(59, 130, 246, 0.1);
+                    border: 1px solid rgba(59, 130, 246, 0.2);
+                    border-radius: 12px;
+                    padding: 16px;
+                    text-align: center;
+                }
+                
+                .stat-value {
+                    font-size: 1.5rem;
+                    font-weight: 600;
+                    color: var(--accent-color);
+                }
+                
+                .stat-label {
+                    font-size: 0.875rem;
+                    color: var(--text-secondary);
+                    margin-top: 4px;
+                }
+                
+                .modern-dropdown .Select-control {
+                    background-color: var(--card-bg) !important;
+                    border: 1px solid var(--border-color) !important;
+                    border-radius: 8px !important;
+                    color: var(--text-primary) !important;
+                }
+                
+                .modern-button {
+                    background: linear-gradient(135deg, var(--primary-color), var(--secondary-color));
+                    border: none;
+                    border-radius: 8px;
+                    color: white;
+                    padding: 12px 24px;
+                    font-weight: 500;
+                    transition: all 0.2s ease;
+                    cursor: pointer;
+                }
+                
+                .modern-button:hover {
+                    transform: translateY(-1px);
+                    box-shadow: 0 10px 20px rgba(37, 99, 235, 0.3);
                 }
             </style>
         </head>
@@ -373,168 +489,201 @@ def create_futuristic_dashboard(top_pairs, initial_start_date, initial_end_date)
     '''
     
     # Prepare dropdown options
-    pair_options = [
-        {'label': f"{pair[0][0]} - {pair[0][1]} (p-val: {pair[1]:.4f})", 'value': f"{pair[0][0]}|{pair[0][1]}"}
-        for pair in top_pairs
+    tuple_type = "Pairs" if n_stocks == 2 else f"{n_stocks}-tuples"
+    tuple_options = [
+        {'label': f"{' - '.join(tuple_data[0])} (p-val: {tuple_data[1]:.4f})", 
+         'value': '|'.join(tuple_data[0])}
+        for tuple_data in top_tuples
     ]
     
     app.layout = dbc.Container([
         dbc.Row([
             dbc.Col([
-                html.H1("🚀 AUTOENCODER PAIRS SCREENER 🚀", 
-                       className="text-center glow-text mb-4"),
-                html.Hr(style={'border-color': '#00ffff'}),
+                html.H1([
+                    "🚀 AUTOENCODER ",
+                    html.Span(f"{tuple_type.upper()} SCREENER", className="gradient-text")
+                ], className="text-center mb-4", style={'fontSize': '2.5rem', 'fontWeight': '700'}),
+                html.Hr(style={'border-color': 'var(--border-color)', 'margin': '2rem 0'}),
             ], width=12)
         ]),
         
         dbc.Row([
             dbc.Col([
                 html.Div([
-                    html.H3("⚙️ CONTROL PANEL", className="glow-text"),
+                    html.H3([
+                        "⚙️ ",
+                        html.Span("CONTROL PANEL", className="gradient-text")
+                    ], style={'fontSize': '1.5rem', 'marginBottom': '24px'}),
                     
                     # Screening Date Range
-                    html.Label("📅 Screening Date Range:", className="glow-text mt-3"),
+                    html.Label("📅 Screening Period", style={'color': 'var(--text-primary)', 'fontWeight': '500', 'marginBottom': '8px'}),
                     dcc.DatePickerRange(
                         id='screening-date-range',
                         start_date=initial_start_date,
                         end_date=initial_end_date,
                         display_format='YYYY-MM-DD',
-                        style={'width': '100%', 'color': '#00ffff'}
+                        style={'width': '100%', 'marginBottom': '16px'}
                     ),
                     
-                    html.Br(),
-                    dbc.Button("🔍 Re-screen Pairs", id="rescreen-button", 
-                              color="info", outline=True, className="mt-2 mb-3"),
+                    html.Button("🔍 Re-screen Combinations", 
+                               id="rescreen-button", 
+                               className="modern-button",
+                               style={'width': '100%', 'marginBottom': '24px'}),
                     
                     # Graphing Date Range
-                    html.Label("📊 Graphing Date Range:", className="glow-text mt-3"),
+                    html.Label("📊 Analysis Period", style={'color': 'var(--text-primary)', 'fontWeight': '500', 'marginBottom': '8px'}),
                     dcc.DatePickerRange(
                         id='graphing-date-range',
                         start_date=initial_start_date,
                         end_date=initial_end_date,
                         display_format='YYYY-MM-DD',
-                        style={'width': '100%', 'color': '#00ffff'}
+                        style={'width': '100%', 'marginBottom': '24px'}
                     ),
                     
-                    html.Br(),
-                    html.Label("Select Cointegrated Pair:", className="glow-text mt-3"),
+                    html.Label(f"Select {tuple_type}", style={'color': 'var(--text-primary)', 'fontWeight': '500', 'marginBottom': '8px'}),
                     dcc.Dropdown(
-                        id='pair-selector',
-                        options=pair_options,
-                        value=pair_options[0]['value'] if pair_options else None,
-                        style={'background-color': 'rgba(0,0,0,0.8)', 'border': '1px solid #00ffff', 'color': '#00ffff'}
+                        id='tuple-selector',
+                        options=tuple_options,
+                        value=tuple_options[0]['value'] if tuple_options else None,
+                        className='modern-dropdown',
+                        style={'marginBottom': '24px'}
                     ),
-                    html.Br(),
-                    html.Label("Display Options:", className="glow-text"),
+                    
+                    html.Label("Display Options", style={'color': 'var(--text-primary)', 'fontWeight': '500', 'marginBottom': '8px'}),
                     dcc.Checklist(
                         id='display-options',
                         options=[
                             {'label': ' Show Spread', 'value': 'spread'},
-                            {'label': ' Show Ratio', 'value': 'ratio'},
                             {'label': ' Show Individual Stocks', 'value': 'stocks'}
                         ],
-                        value=['spread', 'ratio'],
-                        style={'color': '#00ffff'}
+                        value=['spread'],
+                        style={'color': 'var(--text-secondary)', 'marginBottom': '24px'}
                     ),
-                    html.Br(),
-                    html.Label("Background Style:", className="glow-text"),
+                    
+                    html.Label("Chart Theme", style={'color': 'var(--text-primary)', 'fontWeight': '500', 'marginBottom': '8px'}),
                     dcc.Dropdown(
-                        id='background-selector',
+                        id='theme-selector',
                         options=[
-                            {'label': 'Dark Matrix', 'value': 'dark'},
-                            {'label': 'Neon Grid', 'value': 'neon'},
-                            {'label': 'Space Blue', 'value': 'space'},
-                            {'label': 'Cyber Purple', 'value': 'cyber'}
+                            {'label': 'Modern Dark', 'value': 'modern_dark'},
+                            {'label': 'Sleek Blue', 'value': 'sleek_blue'},
+                            {'label': 'Minimal', 'value': 'minimal'},
+                            {'label': 'Professional', 'value': 'professional'}
                         ],
-                        value='dark',
-                        style={'background-color': 'rgba(0,0,0,0.8)', 'border': '1px solid #00ffff', 'color': '#00ffff'}
+                        value='modern_dark',
+                        className='modern-dropdown'
                     )
-                ], className="futuristic-container")
+                ], className="modern-card control-panel")
             ], width=3),
             
             dbc.Col([
                 html.Div([
                     dcc.Graph(id='main-chart', style={'height': '600px'})
-                ], className="futuristic-container")
+                ], className="modern-card")
             ], width=9)
         ]),
         
         dbc.Row([
             dbc.Col([
                 html.Div([
-                    html.H4("📊 PAIR STATISTICS", className="glow-text"),
+                    html.H4([
+                        "📊 ",
+                        html.Span("STATISTICS", className="gradient-text")
+                    ], style={'fontSize': '1.25rem', 'marginBottom': '24px'}),
                     html.Div(id='stats-display')
-                ], className="futuristic-container")
+                ], className="modern-card")
             ], width=12)
         ]),
         
-        # Hidden div to store current pairs data
-        html.Div(id='pairs-data', style={'display': 'none'})
-    ], fluid=True)
+        # Hidden div to store current tuples data
+        html.Div(id='tuples-data', style={'display': 'none'})
+    ], fluid=True, style={'padding': '20px'})
     
     @app.callback(
-        [Output('pairs-data', 'children'),
-         Output('pair-selector', 'options'),
-         Output('pair-selector', 'value')],
+        [Output('tuples-data', 'children'),
+         Output('tuple-selector', 'options'),
+         Output('tuple-selector', 'value')],
         [Input('rescreen-button', 'n_clicks')],
         [dash.dependencies.State('screening-date-range', 'start_date'),
          dash.dependencies.State('screening-date-range', 'end_date')]
     )
-    def rescreen_pairs(n_clicks, start_date, end_date):
+    def rescreen_tuples(n_clicks, start_date, end_date):
         if n_clicks and start_date and end_date:
-            print(f"🔄 Re-screening pairs for period {start_date} to {end_date}")
+            print(f"🔄 Re-screening {tuple_type} for period {start_date} to {end_date}")
             
             # Load encoder
             encoder = load_encoder()
             if encoder is None:
-                return str(top_pairs), pair_options, pair_options[0]['value'] if pair_options else None
+                return str(top_tuples), tuple_options, tuple_options[0]['value'] if tuple_options else None
             
             # Re-screen with new dates
-            new_pairs = screen_stocks(encoder, start_date, end_date, alpha=0.05)
+            new_tuples = screen_stocks(encoder, start_date, end_date, n_stocks=n_stocks, alpha=0.05)
             
-            if new_pairs:
-                new_pair_options = [
-                    {'label': f"{pair[0][0]} - {pair[0][1]} (p-val: {pair[1]:.4f})", 'value': f"{pair[0][0]}|{pair[0][1]}"}
-                    for pair in new_pairs[:10]
+            if new_tuples:
+                new_tuple_options = [
+                    {'label': f"{' - '.join(tuple_data[0])} (p-val: {tuple_data[1]:.4f})", 
+                     'value': '|'.join(tuple_data[0])}
+                    for tuple_data in new_tuples[:10]
                 ]
-                return str(new_pairs), new_pair_options, new_pair_options[0]['value']
+                return str(new_tuples), new_tuple_options, new_tuple_options[0]['value']
         
-        return str(top_pairs), pair_options, pair_options[0]['value'] if pair_options else None
+        return str(top_tuples), tuple_options, tuple_options[0]['value'] if tuple_options else None
     
     @app.callback(
         [Output('main-chart', 'figure'),
          Output('stats-display', 'children')],
-        [Input('pair-selector', 'value'),
+        [Input('tuple-selector', 'value'),
          Input('display-options', 'value'),
-         Input('background-selector', 'value'),
+         Input('theme-selector', 'value'),
          Input('graphing-date-range', 'start_date'),
          Input('graphing-date-range', 'end_date'),
-         Input('pairs-data', 'children')]
+         Input('tuples-data', 'children')]
     )
-    def update_dashboard(selected_pair, display_options, background_style, graph_start, graph_end, pairs_data):
-        if not selected_pair or not graph_start or not graph_end:
-            return {}, "No pair selected or invalid date range"
+    def update_dashboard(selected_tuple, display_options, theme_style, graph_start, graph_end, tuples_data):
+        if not selected_tuple or not graph_start or not graph_end:
+            return {}, "No combination selected or invalid date range"
         
-        stock1, stock2 = selected_pair.split('|')
+        stock_tuple = tuple(selected_tuple.split('|'))
         
         try:
-            # Calculate spread and ratio for graphing period
-            combined_df, spread, ratio, beta = calculate_spread_and_ratio(stock1, stock2, graph_start, graph_end)
+            # Calculate spread for graphing period
+            combined_df, spread, coefficients = calculate_spread(stock_tuple, graph_start, graph_end)
             
             # Calculate p-value for the graphing period
-            asset_data = {stock1: combined_df[stock1].tolist(), stock2: combined_df[stock2].tolist()}
+            asset_data = {stock: combined_df[stock].tolist() for stock in stock_tuple}
             current_p_val = multi_cointegration_test(asset_data)['p_value']
             
-            # Background styles
-            bg_styles = {
-                'dark': {'plot_bgcolor': '#0c0c0c', 'paper_bgcolor': 'rgba(0,0,0,0)'},
-                'neon': {'plot_bgcolor': '#1a1a2e', 'paper_bgcolor': 'rgba(26,26,46,0.8)'},
-                'space': {'plot_bgcolor': '#16213e', 'paper_bgcolor': 'rgba(22,33,62,0.8)'},
-                'cyber': {'plot_bgcolor': '#2d1b69', 'paper_bgcolor': 'rgba(45,27,105,0.8)'}
+            # Theme styles
+            themes = {
+                'modern_dark': {
+                    'plot_bgcolor': '#0f172a',
+                    'paper_bgcolor': 'rgba(0,0,0,0)',
+                    'gridcolor': 'rgba(59, 130, 246, 0.1)',
+                    'colors': ['#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6']
+                },
+                'sleek_blue': {
+                    'plot_bgcolor': '#1e293b',
+                    'paper_bgcolor': 'rgba(30, 41, 59, 0.8)',
+                    'gridcolor': 'rgba(59, 130, 246, 0.2)',
+                    'colors': ['#60a5fa', '#34d399', '#fbbf24', '#f87171', '#a78bfa']
+                },
+                'minimal': {
+                    'plot_bgcolor': '#f8fafc',
+                    'paper_bgcolor': 'rgba(248, 250, 252, 0.9)',
+                    'gridcolor': 'rgba(148, 163, 184, 0.3)',
+                    'colors': ['#1e40af', '#dc2626', '#059669', '#d97706', '#7c3aed']
+                },
+                'professional': {
+                    'plot_bgcolor': '#111827',
+                    'paper_bgcolor': 'rgba(17, 24, 39, 0.95)',
+                    'gridcolor': 'rgba(75, 85, 99, 0.3)',
+                    'colors': ['#2563eb', '#dc2626', '#059669', '#d97706', '#7c3aed']
+                }
             }
             
+            current_theme = themes[theme_style]
+            
             # Create subplots
-            subplot_count = len([opt for opt in display_options if opt in ['spread', 'ratio', 'stocks']])
+            subplot_count = len([opt for opt in display_options if opt in ['spread', 'stocks']])
             if subplot_count == 0:
                 subplot_count = 1
                 
@@ -545,68 +694,67 @@ def create_futuristic_dashboard(top_pairs, initial_start_date, initial_end_date)
             )
             
             current_row = 1
+            color_idx = 0
             
             # Add traces based on display options
             if 'stocks' in display_options:
-                fig.add_trace(
-                    go.Scatter(x=combined_df.index, y=combined_df[stock1], 
-                              name=f'{stock1}', line=dict(color='#00ffff', width=2)),
-                    row=current_row, col=1
-                )
-                fig.add_trace(
-                    go.Scatter(x=combined_df.index, y=combined_df[stock2], 
-                              name=f'{stock2}', line=dict(color='#ff00ff', width=2)),
-                    row=current_row, col=1
-                )
+                for stock in stock_tuple:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=combined_df.index, 
+                            y=combined_df[stock], 
+                            name=stock, 
+                            line=dict(color=current_theme['colors'][color_idx % len(current_theme['colors'])], width=2)
+                        ),
+                        row=current_row, col=1
+                    )
+                    color_idx += 1
                 current_row += 1
             
             if 'spread' in display_options:
+                # Create spread equation string
+                spread_eq = f"{stock_tuple[0]}"
+                for i, stock in enumerate(stock_tuple[1:], 1):
+                    coef = coefficients[stock]
+                    spread_eq += f" {'+' if coef >= 0 else '-'} {abs(coef):.3f}*{stock}"
+                
                 fig.add_trace(
-                    go.Scatter(x=spread.index, y=spread, 
-                              name=f'Spread ({stock1} - {beta:.3f}*{stock2})', 
-                              line=dict(color='#ffff00', width=2)),
+                    go.Scatter(
+                        x=spread.index, 
+                        y=spread, 
+                        name=f'Spread ({spread_eq})', 
+                        line=dict(color=current_theme['colors'][color_idx % len(current_theme['colors'])], width=3)
+                    ),
                     row=current_row, col=1
                 )
                 # Add zero line for spread
-                fig.add_hline(y=0, line_dash="dash", line_color="#ffffff", 
-                             row=current_row, col=1, opacity=0.5)
-                current_row += 1
+                fig.add_hline(y=0, line_dash="dash", line_color="#94a3b8", 
+                             row=current_row, col=1, opacity=0.6)
             
-            if 'ratio' in display_options:
-                fig.add_trace(
-                    go.Scatter(x=ratio.index, y=ratio, 
-                              name=f'Ratio ({stock1}/{stock2})', 
-                              line=dict(color='#00ff00', width=2)),
-                    row=current_row, col=1
-                )
-                # Add mean line for ratio
-                mean_ratio = ratio.mean()
-                fig.add_hline(y=mean_ratio, line_dash="dash", line_color="#ffffff", 
-                             row=current_row, col=1, opacity=0.5)
-            
-            # Update layout with futuristic styling
+            # Update layout with modern styling
             fig.update_layout(
                 title=dict(
-                    text=f"<b>🎯 {stock1} vs {stock2} ANALYSIS | P-VAL: {current_p_val:.6f}</b>",
-                    font=dict(color='#00ffff', size=20),
+                    text=f"<b>📈 {' × '.join(stock_tuple)} Analysis | P-VAL: {current_p_val:.6f}</b>",
+                    font=dict(color='var(--text-primary)', size=20, family='Inter'),
                     x=0.5
                 ),
-                **bg_styles[background_style],
-                font=dict(color='#00ffff', family="Orbitron"),
+                **current_theme,
+                font=dict(color='var(--text-primary)', family='Inter'),
                 showlegend=True,
                 legend=dict(
-                    bgcolor='rgba(0,0,0,0.7)',
-                    bordercolor='#00ffff',
-                    borderwidth=1
+                    bgcolor='rgba(30, 41, 59, 0.8)',
+                    bordercolor='var(--border-color)',
+                    borderwidth=1,
+                    font=dict(color='var(--text-primary)')
                 ),
                 xaxis=dict(
-                    gridcolor='rgba(0,255,255,0.3)',
-                    color='#00ffff',
+                    gridcolor=current_theme['gridcolor'],
+                    color='var(--text-primary)',
                     showgrid=True
                 ),
                 yaxis=dict(
-                    gridcolor='rgba(0,255,255,0.3)',
-                    color='#00ffff',
+                    gridcolor=current_theme['gridcolor'],
+                    color='var(--text-primary)',
                     showgrid=True
                 ),
                 hovermode='x unified'
@@ -615,14 +763,14 @@ def create_futuristic_dashboard(top_pairs, initial_start_date, initial_end_date)
             # Update all subplot axes
             for i in range(1, subplot_count + 1):
                 fig.update_xaxes(
-                    gridcolor='rgba(0,255,255,0.3)',
-                    color='#00ffff',
+                    gridcolor=current_theme['gridcolor'],
+                    color='var(--text-primary)',
                     showgrid=True,
                     row=i, col=1
                 )
                 fig.update_yaxes(
-                    gridcolor='rgba(0,255,255,0.3)',
-                    color='#00ffff',
+                    gridcolor=current_theme['gridcolor'],
+                    color='var(--text-primary)',
                     showgrid=True,
                     row=i, col=1
                 )
@@ -630,32 +778,49 @@ def create_futuristic_dashboard(top_pairs, initial_start_date, initial_end_date)
             # Statistics display
             screening_p_val = None
             try:
-                current_pairs = eval(pairs_data) if pairs_data else top_pairs
-                screening_p_val = next((pair[1] for pair in current_pairs if f"{pair[0][0]}|{pair[0][1]}" == selected_pair), None)
+                current_tuples = eval(tuples_data) if tuples_data else top_tuples
+                screening_p_val = next((tuple_data[1] for tuple_data in current_tuples 
+                                      if '|'.join(tuple_data[0]) == selected_tuple), None)
             except:
                 screening_p_val = None
             
             stats = html.Div([
-                dbc.Row([
-                    dbc.Col([
-                        html.P(f"📈 Stock 1: {stock1}", className="glow-text"),
-                        html.P(f"📉 Stock 2: {stock2}", className="glow-text"),
-                        html.P(f"🔢 Beta: {beta:.4f}", className="glow-text"),
-                        html.P(f"📅 Graph Period: {graph_start} to {graph_end}", className="glow-text"),
-                    ], width=4),
-                    dbc.Col([
-                        html.P(f"🎯 Current P-Value: {current_p_val:.6f}", className="glow-text"),
-                        html.P(f"📊 Screening P-Value: {screening_p_val:.6f}" if screening_p_val else "📊 Screening P-Value: N/A", className="glow-text"),
-                        html.P(f"📏 Spread Mean: {spread.mean():.4f}", className="glow-text"),
-                        html.P(f"📐 Spread Std: {spread.std():.4f}", className="glow-text"),
-                    ], width=4),
-                    dbc.Col([
-                        html.P(f"⚖️ Ratio Mean: {ratio.mean():.4f}", className="glow-text"),
-                        html.P(f"📊 Ratio Std: {ratio.std():.4f}", className="glow-text"),
-                        html.P(f"📅 Data Points: {len(combined_df)}", className="glow-text"),
-                        html.P(f"🔍 Cointegrated: {'✅ YES' if current_p_val < 0.05 else '❌ NO'}", className="glow-text"),
-                    ], width=4)
-                ])
+                html.Div([
+                    html.Div([
+                        html.Div(f"{len(stock_tuple)}", className="stat-value"),
+                        html.Div("Stocks", className="stat-label")
+                    ], className="stat-item"),
+                    
+                    html.Div([
+                        html.Div(f"{current_p_val:.6f}", className="stat-value"),
+                        html.Div("Current P-Value", className="stat-label")
+                    ], className="stat-item"),
+                    
+                    html.Div([
+                        html.Div(f"{screening_p_val:.6f}" if screening_p_val else "N/A", className="stat-value"),
+                        html.Div("Screening P-Value", className="stat-label")
+                    ], className="stat-item"),
+                    
+                    html.Div([
+                        html.Div(f"{spread.mean():.4f}", className="stat-value"),
+                        html.Div("Spread Mean", className="stat-label")
+                    ], className="stat-item"),
+                    
+                    html.Div([
+                        html.Div(f"{spread.std():.4f}", className="stat-value"),
+                        html.Div("Spread Std", className="stat-label")
+                    ], className="stat-item"),
+                    
+                    html.Div([
+                        html.Div(f"{len(combined_df)}", className="stat-value"),
+                        html.Div("Data Points", className="stat-label")
+                    ], className="stat-item"),
+                    
+                    html.Div([
+                        html.Div("✅ YES" if current_p_val < 0.05 else "❌ NO", className="stat-value"),
+                        html.Div("Cointegrated", className="stat-label")
+                    ], className="stat-item")
+                ], className="stats-grid")
             ])
             
             return fig, stats
@@ -664,10 +829,10 @@ def create_futuristic_dashboard(top_pairs, initial_start_date, initial_end_date)
             error_fig = go.Figure()
             error_fig.update_layout(
                 title=f"Error: {str(e)}",
-                plot_bgcolor='#0c0c0c',
+                plot_bgcolor='#0f172a',
                 paper_bgcolor='rgba(0,0,0,0)'
             )
-            return error_fig, f"Error processing pair: {str(e)}"
+            return error_fig, f"Error processing combination: {str(e)}"
     
     return app
 
@@ -675,8 +840,11 @@ def main():
     """
     Main screening application
     """
-    print("🚀 AUTOENCODER PAIRS SCREENER INITIATED")
-    print("=" * 50)
+    print("🚀 AUTOENCODER STOCK COMBINATION SCREENER INITIATED")
+    print("=" * 60)
+    
+    # Get user preferences
+    n_stocks = get_user_preferences()
     
     # Load trained encoder
     encoder = load_encoder()
@@ -692,26 +860,27 @@ def main():
     print(f"🎯 Alpha threshold: {alpha}")
     print(f"🔧 Expected input dimension: {LOOKBACK}")
     
-    # Screen for cointegrated pairs
-    top_pairs = screen_stocks(encoder, start_date, end_date, alpha=alpha)
+    # Screen for cointegrated tuples
+    top_tuples = screen_stocks(encoder, start_date, end_date, n_stocks=n_stocks, alpha=alpha)
     
-    if not top_pairs:
-        print("❌ No cointegrated pairs found. Try increasing alpha or checking data availability.")
+    if not top_tuples:
+        print("❌ No cointegrated combinations found. Try increasing alpha or checking data availability.")
         return
     
-    print("\n🏆 TOP COINTEGRATED PAIRS:")
-    print("-" * 40)
-    for i, (pair, p_val) in enumerate(top_pairs[:10], 1):
-        print(f"{i:2d}. {pair[0]} - {pair[1]}: p-value = {p_val:.6f}")
+    tuple_type = "pairs" if n_stocks == 2 else f"{n_stocks}-tuples"
+    print(f"\n🏆 TOP COINTEGRATED {tuple_type.upper()}:")
+    print("-" * 50)
+    for i, (stocks, p_val) in enumerate(top_tuples[:10], 1):
+        print(f"{i:2d}. {' × '.join(stocks)}: p-value = {p_val:.6f}")
     
     # Create and run dashboard
-    app = create_futuristic_dashboard(top_pairs[:10], start_date, end_date)
+    app = create_modern_dashboard(top_tuples[:10], start_date, end_date, n_stocks)
     
-    print("\n🚀 Launching futuristic dashboard...")
+    print(f"\n🚀 Launching modern {tuple_type} dashboard...")
     print("📡 Access at: http://127.0.0.1:8050")
     print("🛑 Press Ctrl+C to stop")
     
-    # Fixed: Use app.run() instead of app.run_server()
+    # Use app.run() instead of app.run_server()
     app.run(debug=True, host='127.0.0.1', port=8050)
 
 if __name__ == "__main__":
