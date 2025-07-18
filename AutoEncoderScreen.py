@@ -21,20 +21,26 @@ import dash_bootstrap_components as dbc
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from functools import partial
+import multiprocessing
+import time
 
 # Configuration
 DIRECTORY = 'stock_data/Data/'
 LOOKBACK = 256  # Must match training lookback
 ENCODER_PATH = "encoder.pkl"
+# Determine optimal number of threads based on CPU count (leave one core free for system)
+MAX_WORKERS = max(1, multiprocessing.cpu_count() - 1)
+print(f"🔧 System has {multiprocessing.cpu_count()} CPU cores, using {MAX_WORKERS} worker threads")
 
 def get_user_preferences():
     """
-    Get user preferences for number of stocks per group
+    Get user preferences for number of stocks per group and threading options
     """
     print("\n" + "="*60)
     print("🚀 AUTOENCODER PAIRS/TRIPLETS SCREENER CONFIGURATION")
     print("="*60)
     
+    # Get n_stocks preference
     while True:
         try:
             n_stocks = int(input("\n📊 How many stocks per group do you want to analyze?\n"
@@ -50,7 +56,25 @@ def get_user_preferences():
         except ValueError:
             print("❌ Please enter a valid number")
     
-    print(f"\n✅ Selected: {n_stocks}-tuple trading")
+    # Get threading preference
+    while True:
+        try:
+            num_threads = input(f"\n⚙️ Multithreading settings (default: {MAX_WORKERS} threads)\n"
+                               f"   Press Enter to use default ({MAX_WORKERS}) or specify number of threads: ")
+            
+            if num_threads == "":
+                num_threads = MAX_WORKERS
+                break
+            else:
+                num_threads = int(num_threads)
+                if num_threads >= 1:
+                    break
+                else:
+                    print("❌ Please enter a positive number")
+        except ValueError:
+            print("❌ Please enter a valid number")
+    
+    print(f"\n✅ Selected: {n_stocks}-tuple trading with {num_threads} worker threads")
     if n_stocks == 2:
         print("📈 You'll be analyzing stock pairs")
     elif n_stocks == 3:
@@ -58,7 +82,52 @@ def get_user_preferences():
     else:
         print(f"📈 You'll be analyzing {n_stocks}-stock combinations")
     
-    return n_stocks
+    return n_stocks, num_threads
+
+def process_stock(file_name, start_date, end_date, encoder, stride):
+    """
+    Process a single stock file
+    This function is designed to be run in parallel
+    """
+    try:
+        df = pd.read_csv(DIRECTORY + file_name, index_col=0)
+        df = df[start_date:end_date]
+        df_price = df['Close']
+        
+        # Need sufficient data for rolling z-score calculation and window generation
+        min_required = LOOKBACK * 2 + stride  # Rolling calculation + windows + buffer
+        if len(df_price) < min_required:
+            return None, f"⚠️  Skipping {file_name}: insufficient data ({len(df_price)} points, need {min_required})"
+        
+        # Apply same preprocessing: rolling z-score
+        rolling_mean = df_price.rolling(window=LOOKBACK).mean()
+        rolling_std = df_price.rolling(window=LOOKBACK).std()
+        rolling_zscore = (df_price - rolling_mean) / rolling_std
+        rolling_zscore = rolling_zscore.dropna(how='all').to_list()
+        
+        # Ensure we have enough data after rolling calculation
+        if len(rolling_zscore) < LOOKBACK + stride:
+            return None, f"⚠️  Skipping {file_name}: insufficient z-score data ({len(rolling_zscore)} points)"
+        
+        # Create windows - ensure we get exactly LOOKBACK-sized windows
+        x = stride_window(stride, rolling_zscore, LOOKBACK)
+        
+        if len(x) == 0:
+            return None, f"⚠️  Skipping {file_name}: no valid windows generated"
+        
+        # Verify window dimensions
+        if x.shape[1] != LOOKBACK:
+            return None, f"❌ Dimension mismatch for {file_name}: expected {LOOKBACK}, got {x.shape[1]}"
+        
+        # Encode using trained encoder
+        stock_vect = encoder.predict(x).squeeze()
+        stock_name = ''.join([letter for letter in file_name if letter.isupper()])
+        
+        # Return the stock name and encoded vector
+        return (stock_name, stock_vect.tolist()), f"✅ Successfully encoded {stock_name}: {len(stock_vect)} features"
+        
+    except Exception as e:
+        return None, f"❌ Error processing {file_name}: {e}"
 
 def multi_cointegration_test(
     data_dict,
@@ -134,37 +203,59 @@ def process_single_cluster(cluster_id, stock_list, start_date, end_date, n_stock
     cluster_results = []
     
     if len(stock_list) < n_stocks:
+        print(f"⚠️  Cluster {cluster_id}: Skipping - only {len(stock_list)} stocks (need {n_stocks})")
         return cluster_results
     
     # Generate combinations within this cluster only
     cluster_combos = list(combinations(stock_list, n_stocks))
     
-    print(f"🔍 Cluster {cluster_id}: Testing {len(cluster_combos)} {n_stocks}-tuples")
+    print(f"🔍 Cluster {cluster_id}: Testing {len(cluster_combos)} {n_stocks}-tuples from {len(stock_list)} stocks")
+    print(f"   📋 Stocks in cluster: {', '.join(stock_list)}")
+    
+    # Progress tracking for this cluster
+    tested_count = 0
+    passed_count = 0
     
     # Test cointegration for combinations in this cluster
-    for assets in cluster_combos:
+    for i, assets in enumerate(cluster_combos):
         try:
             asset_data = {}
+            all_data_available = True
+            
             for name in assets:
                 matching_files = [f for f in files if name in f]
                 if not matching_files:
-                    continue
+                    all_data_available = False
+                    break
                     
                 df = pd.read_csv(DIRECTORY + matching_files[0], index_col=0)
                 df = df[start_date:end_date]
                 df.index = pd.to_datetime(df.index)
                 asset_data[name] = df.Close.to_list()
             
-            if len(asset_data) == n_stocks:
+            if all_data_available and len(asset_data) == n_stocks:
+                tested_count += 1
                 p_val = multi_cointegration_test(asset_data)['p_value']
-                if p_val <= alpha:  # Only keep results that pass alpha threshold
+                
+                # Verbose logging for each test
+                tuple_name = ' × '.join(assets)
+                if p_val <= alpha:
+                    passed_count += 1
                     cluster_results.append((assets, p_val))
+                    print(f"   ✅ {tuple_name}: p-value = {p_val:.6f} (COINTEGRATED)")
+                else:
+                    print(f"   ❌ {tuple_name}: p-value = {p_val:.6f} (not cointegrated)")
+                
+                # Progress update every 10 tests
+                if tested_count % 10 == 0:
+                    print(f"   📊 Cluster {cluster_id}: {tested_count}/{len(cluster_combos)} tested, {passed_count} cointegrated so far")
                     
         except Exception as e:
-            # Silently continue on errors to avoid cluttering output
+            print(f"   ⚠️  Error testing {' × '.join(assets)}: {str(e)[:50]}...")
             continue
     
-    print(f"✅ Cluster {cluster_id}: Found {len(cluster_results)} cointegrated {n_stocks}-tuples")
+    print(f"✅ Cluster {cluster_id} COMPLETE: {passed_count}/{tested_count} combinations passed (α={alpha})")
+    print(f"   🎯 Success rate: {(passed_count/tested_count*100):.1f}%" if tested_count > 0 else "   🎯 Success rate: 0%")
     return cluster_results
 
 def stride_window(stride, lst, window):
@@ -203,15 +294,18 @@ def load_encoder():
         print(f"❌ Error loading encoder: {e}")
         return None
 
-def screen_stocks(encoder, start_date, end_date, n_stocks=2, stride=64, alpha=0.05):
+def screen_stocks(encoder, start_date, end_date, n_stocks=2, stride=64, alpha=0.05, num_threads=MAX_WORKERS):
     """
     Screen stocks using the trained encoder and same preprocessing pipeline
     """
-    print(f"🔍 Screening {n_stocks}-tuples from {start_date} to {end_date}")
+    print(f"🔍 Screening {n_stocks}-tuples from {start_date} to {end_date} using {num_threads} threads")
     print(f"📊 Using alpha = {alpha} for cointegration test")
     
-    # Get vector universe using trained encoder
-    vector_universe = get_vector_universe(encoder, start_date, end_date, stride)
+    # Get vector universe using trained encoder (multithreaded)
+    start_time = time.time()
+    vector_universe = get_vector_universe_multithreaded(encoder, start_date, end_date, stride, num_threads)
+    encode_time = time.time() - start_time
+    print(f"⏱️ Stock encoding completed in {encode_time:.2f} seconds")
     
     if not vector_universe:
         print("❌ No valid stock data found!")
@@ -219,8 +313,11 @@ def screen_stocks(encoder, start_date, end_date, n_stocks=2, stride=64, alpha=0.
     
     print(f"📈 Found {len(vector_universe)} valid stocks for screening")
     
-    # Find cointegrated tuples using clustering (now multithreaded)
-    cointegrated_tuples = cluster_pvals_multithreaded(vector_universe, start_date, end_date, n_stocks, alpha)
+    # Find cointegrated tuples using clustering (multithreaded)
+    start_time = time.time()
+    cointegrated_tuples = cluster_pvals_multithreaded(vector_universe, start_date, end_date, n_stocks, alpha, num_threads)
+    cluster_time = time.time() - start_time
+    print(f"⏱️ Clustering and cointegration testing completed in {cluster_time:.2f} seconds")
     
     if not cointegrated_tuples:
         print(f"❌ No cointegrated {n_stocks}-tuples found with alpha = {alpha}")
@@ -233,71 +330,67 @@ def screen_stocks(encoder, start_date, end_date, n_stocks=2, stride=64, alpha=0.
     
     return sorted_tuples
 
-def get_vector_universe(encoder, start_date, end_date, stride):
+def get_vector_universe_multithreaded(encoder, start_date, end_date, stride, num_threads=MAX_WORKERS):
     """
     Apply same preprocessing pipeline and encode stocks using trained encoder
+    Uses multithreading for faster processing
     """
     files = [f for f in os.listdir(DIRECTORY) if os.path.isfile(os.path.join(DIRECTORY, f))]
     vector_universe = {}
     
-    for file_name in tqdm(files, desc="Processing stocks"):
-        try:
-            df = pd.read_csv(DIRECTORY + file_name, index_col=0)
-            df = df[start_date:end_date]
-            df_price = df['Close']
-            
-            # Need sufficient data for rolling z-score calculation and window generation
-            min_required = LOOKBACK * 2 + stride  # Rolling calculation + windows + buffer
-            if len(df_price) < min_required:
-                print(f"⚠️  Skipping {file_name}: insufficient data ({len(df_price)} points, need {min_required})")
-                continue
+    print(f"🚀 Processing {len(files)} stock files using {num_threads} threads")
+    
+    # Create a progress bar for overall completion
+    pbar = tqdm(total=len(files), desc="Processing stocks")
+    
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        # Submit all stock processing tasks
+        future_to_file = {
+            executor.submit(process_stock, file_name, start_date, end_date, encoder, stride): file_name
+            for file_name in files
+        }
+        
+        # Collect results as they complete
+        for future in as_completed(future_to_file):
+            file_name = future_to_file[future]
+            try:
+                result, message = future.result()
+                if result:  # If processing was successful
+                    stock_name, stock_vector = result
+                    vector_universe[stock_name] = stock_vector
                 
-            print(f"📊 Processing {file_name}: {len(df_price)} data points")
-            
-            # Apply same preprocessing: rolling z-score
-            rolling_mean = df_price.rolling(window=LOOKBACK).mean()
-            rolling_std = df_price.rolling(window=LOOKBACK).std()
-            rolling_zscore = (df_price - rolling_mean) / rolling_std
-            rolling_zscore = rolling_zscore.dropna(how='all').to_list()
-            
-            # Ensure we have enough data after rolling calculation
-            if len(rolling_zscore) < LOOKBACK + stride:
-                print(f"⚠️  Skipping {file_name}: insufficient z-score data ({len(rolling_zscore)} points)")
-                continue
-            
-            # Create windows - ensure we get exactly LOOKBACK-sized windows
-            x = stride_window(stride, rolling_zscore, LOOKBACK)
-            
-            if len(x) == 0:
-                print(f"⚠️  Skipping {file_name}: no valid windows generated")
-                continue
-            
-            # Verify window dimensions
-            print(f"🔍 Window shape for {file_name}: {x.shape}")
-            if x.shape[1] != LOOKBACK:
-                print(f"❌ Dimension mismatch for {file_name}: expected {LOOKBACK}, got {x.shape[1]}")
-                continue
+                # Print message (success or failure)
+                print(message)
                 
-            # Encode using trained encoder
-            stock_vect = encoder.predict(x).squeeze()
-            stock_name = ''.join([letter for letter in file_name if letter.isupper()])
-            vector_universe[stock_name] = stock_vect.tolist()
-            print(f"✅ Successfully encoded {stock_name}: {len(stock_vect)} features")
+            except Exception as e:
+                print(f"❌ Error processing {file_name}: {e}")
             
-        except Exception as e:
-            print(f"❌ Error processing {file_name}: {e}")
-            continue
+            # Update progress bar
+            pbar.update(1)
+    
+    # Close progress bar
+    pbar.close()
     
     return vector_universe
 
-def cluster_pvals_multithreaded(vector_universe, start_date, end_date, n_stocks, alpha, max_workers=4):
+def cluster_pvals_multithreaded(vector_universe, start_date, end_date, n_stocks, alpha, num_threads=MAX_WORKERS):
     """
     Cluster stocks and find cointegrated N-tuples using multithreading
     Only tests cointegration WITHIN each cluster (not across clusters)
     """
-    print(f"🔬 Clustering stocks and testing {n_stocks}-tuple cointegration (multithreaded)...")
+    print(f"🔬 Clustering stocks and testing {n_stocks}-tuple cointegration (multithreaded with {num_threads} workers)...")
     
-    cluster_model = HDBSCAN(min_cluster_size=max(6, n_stocks + 1))
+    # Adjusted HDBSCAN parameters to create more clusters
+    min_cluster_size = max(3, n_stocks)  # Reduced from max(6, n_stocks + 1)
+    cluster_model = HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=2,  # Reduced to allow smaller clusters
+        cluster_selection_epsilon=0.1,  # Allow tighter clusters
+        alpha=0.8  # Lower alpha for more clusters
+    )
+    
+    print(f"🔧 HDBSCAN Parameters: min_cluster_size={min_cluster_size}, min_samples=2")
+    
     data_labels = list(vector_universe.keys())
     vector_data = list(vector_universe.values())
     
@@ -306,10 +399,11 @@ def cluster_pvals_multithreaded(vector_universe, start_date, end_date, n_stocks,
     pad = lambda lst: [x + [0] * (max(map(len, lst)) - len(x)) for x in lst]
     vector_data = pad(flatten_to_2d(vector_data))
     
+    print(f"📊 Performing HDBSCAN clustering on {len(data_labels)} stocks...")
     cluster_set = cluster_model.fit_predict(vector_data).tolist()
     VECTOR_CLUSTER = dict(zip(data_labels, cluster_set))
     
-    # Sort clusters
+    # Sort clusters and analyze
     sorted_clusters = {}
     for key, value in VECTOR_CLUSTER.items():
         if value not in sorted_clusters.keys():
@@ -317,16 +411,51 @@ def cluster_pvals_multithreaded(vector_universe, start_date, end_date, n_stocks,
         else:
             sorted_clusters[value].append(key)
     
+    # Print detailed cluster analysis
+    print(f"\n📋 CLUSTER ANALYSIS RESULTS:")
+    print("=" * 80)
+    
+    total_stocks_in_clusters = 0
+    noise_stocks = 0
+    
+    for cluster_id, stock_list in sorted(sorted_clusters.items()):
+        if cluster_id == -1:
+            noise_stocks = len(stock_list)
+            print(f"🔇 NOISE CLUSTER: {len(stock_list)} stocks (not clustered)")
+            print(f"   Noise stocks: {', '.join(stock_list[:10])}{'...' if len(stock_list) > 10 else ''}")
+        else:
+            total_stocks_in_clusters += len(stock_list)
+            print(f"🎯 CLUSTER {cluster_id}: {len(stock_list)} stocks")
+            print(f"   Stocks: {', '.join(stock_list)}")
+    
+    print("=" * 80)
+    print(f"📊 SUMMARY:")
+    print(f"   Total clusters found: {len([k for k in sorted_clusters.keys() if k != -1])}")
+    print(f"   Total stocks in clusters: {total_stocks_in_clusters}")
+    print(f"   Noise stocks: {noise_stocks}")
+    print(f"   Clustering efficiency: {(total_stocks_in_clusters/(total_stocks_in_clusters + noise_stocks)*100):.1f}%")
+    print("=" * 80)
+    
     # Filter clusters that have enough stocks for N-tuples
     valid_clusters = {k: v for k, v in sorted_clusters.items() 
                      if len(v) >= n_stocks and k != -1}  # Exclude noise cluster (-1)
     
-    print(f"📊 Found {len(valid_clusters)} valid clusters for {n_stocks}-tuple analysis")
+    print(f"✅ Found {len(valid_clusters)} valid clusters for {n_stocks}-tuple analysis")
+    
+    if len(valid_clusters) == 0:
+        print("❌ No valid clusters found! Try adjusting clustering parameters.")
+        return []
     
     # Calculate total combinations across all clusters
     total_combos = sum(len(list(combinations(stocks, n_stocks))) 
                       for stocks in valid_clusters.values())
-    print(f"🔍 Total combinations to test: {total_combos}")
+    print(f"🔍 Total combinations to test: {total_combos:,}")
+    
+    # Show breakdown by cluster
+    print(f"\n📊 COMBINATIONS PER CLUSTER:")
+    for cluster_id, stocks in valid_clusters.items():
+        combos = len(list(combinations(stocks, n_stocks)))
+        print(f"   Cluster {cluster_id}: {combos:,} combinations from {len(stocks)} stocks")
     
     # Prepare file list once
     files = [f for f in os.listdir(DIRECTORY) if os.path.isfile(os.path.join(DIRECTORY, f))]
@@ -334,9 +463,10 @@ def cluster_pvals_multithreaded(vector_universe, start_date, end_date, n_stocks,
     # Process clusters in parallel
     all_results = []
     
-    print(f"🚀 Starting multithreaded processing with {max_workers} workers...")
+    print(f"\n🚀 Starting multithreaded cointegration testing with {num_threads} workers...")
+    print("=" * 80)
     
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
         # Create a partial function with common parameters
         process_cluster = partial(process_single_cluster, 
                                 start_date=start_date, 
@@ -352,16 +482,34 @@ def cluster_pvals_multithreaded(vector_universe, start_date, end_date, n_stocks,
         }
         
         # Collect results as they complete
+        completed_clusters = 0
         for future in as_completed(future_to_cluster):
             cluster_id = future_to_cluster[future]
+            completed_clusters += 1
             try:
                 cluster_results = future.result()
                 all_results.extend(cluster_results)
+                print(f"📈 Progress: {completed_clusters}/{len(valid_clusters)} clusters completed")
             except Exception as e:
                 print(f"❌ Error processing cluster {cluster_id}: {e}")
     
+    print("=" * 80)
     print(f"✅ Multithreaded processing complete!")
     print(f"🎯 Found {len(all_results)} total cointegrated {n_stocks}-tuples across all clusters")
+    
+    # Show results breakdown by cluster
+    if all_results:
+        print(f"\n🏆 COINTEGRATED {n_stocks.upper()}-TUPLES BY CLUSTER:")
+        cluster_results_count = {}
+        for result in all_results:
+            # Find which cluster this result belongs to
+            for cluster_id, stocks in valid_clusters.items():
+                if all(stock in stocks for stock in result[0]):
+                    cluster_results_count[cluster_id] = cluster_results_count.get(cluster_id, 0) + 1
+                    break
+        
+        for cluster_id, count in cluster_results_count.items():
+            print(f"   Cluster {cluster_id}: {count} cointegrated combinations")
     
     return all_results
 
@@ -899,7 +1047,7 @@ def main():
     print("=" * 60)
     
     # Get user preferences
-    n_stocks = get_user_preferences()
+    n_stocks, num_threads = get_user_preferences()
     
     # Load trained encoder
     encoder = load_encoder()
@@ -911,12 +1059,20 @@ def main():
     end_date = '2021-12-31'    # Longer period to get more data points
     alpha = 0.05
     
+    print(f"⏱️ Starting multithreaded processing with {num_threads} worker threads")
     print(f"⏰ Screening period: {start_date} to {end_date}")
     print(f"🎯 Alpha threshold: {alpha}")
     print(f"🔧 Expected input dimension: {LOOKBACK}")
     
+    # Start time measurement
+    total_start_time = time.time()
+    
     # Screen for cointegrated tuples
-    top_tuples = screen_stocks(encoder, start_date, end_date, n_stocks=n_stocks, alpha=alpha)
+    top_tuples = screen_stocks(encoder, start_date, end_date, n_stocks=n_stocks, alpha=alpha, num_threads=num_threads)
+    
+    # Calculate total execution time
+    total_time = time.time() - total_start_time
+    print(f"⏱️ Total execution time: {total_time:.2f} seconds")
     
     if not top_tuples:
         print("❌ No cointegrated combinations found. Try increasing alpha or checking data availability.")
