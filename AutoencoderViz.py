@@ -250,7 +250,15 @@ def cluster_and_test_pairs(vector_universe, start_date, end_date, alpha=0.1, inc
         return [], {}
     
     print("🔍 Preparing data for clustering...")
-    cluster_model = HDBSCAN(min_cluster_size=6)
+    
+    # More aggressive clustering parameters to get more clusters
+    cluster_model = HDBSCAN(
+        min_cluster_size=3,  # Reduced from 6 to 3
+        min_samples=2,       # Minimum samples in a neighborhood
+        cluster_selection_epsilon=0.1,  # Distance threshold
+        alpha=1.0           # Controls how conservative the clustering is
+    )
+    
     data_labels = list(vector_universe.keys())
     vector_data = list(vector_universe.values())
     
@@ -258,6 +266,8 @@ def cluster_and_test_pairs(vector_universe, start_date, end_date, alpha=0.1, inc
     flatten_to_2d = lambda data: [[i for sub in ([el] if not isinstance(el, list) else el) for i in (sub if not isinstance(sub, list) else [x for x in sub])] if not isinstance(item, list) else [i for sub in item for i in (sub if not isinstance(sub, list) else [x for x in sub])] for item in data]
     pad = lambda lst: [x + [0] * (max(map(len, lst)) - len(x)) for x in lst]
     vector_data = pad(flatten_to_2d(vector_data))
+    
+    print(f"📏 Data shape: {len(vector_data)} stocks × {len(vector_data[0])} features")
     
     print("\n🧮 Running HDBSCAN clustering...")
     cluster_set = cluster_model.fit_predict(vector_data).tolist()
@@ -299,8 +309,11 @@ def cluster_and_test_pairs(vector_universe, start_date, end_date, alpha=0.1, inc
     print(f"   • Total stocks processed: {len(data_labels)}")
     print("="*60)
     
-    # Generate combinations
+    # Generate combinations - include pairs from ALL clusters (even noise points)
     print("\n🔄 Generating stock combinations...")
+    pairs_from_clusters = 0
+    pairs_from_noise = 0
+    
     for key, lst in sorted_clusters.items():
         if len(lst) >= 2:
             # Generate pairs
@@ -308,12 +321,24 @@ def cluster_and_test_pairs(vector_universe, start_date, end_date, alpha=0.1, inc
             for item in pairs:
                 combo_universe.append(item)
             
+            if key == -1:
+                pairs_from_noise += len(pairs)
+                print(f"   🔸 Generated {len(pairs)} pairs from noise points")
+            else:
+                pairs_from_clusters += len(pairs)
+                print(f"   📊 Generated {len(pairs)} pairs from cluster {key}")
+            
             # Generate triplets if requested
             if include_triplets and len(lst) >= 3:
-                print(f"   📈 Generating triplets for cluster {key} ({len(lst)} stocks)")
                 triplets = list(combinations(lst, 3))
                 for item in triplets:
                     combo_universe.append(item)
+                print(f"   📈 Generated {len(triplets)} triplets from cluster {key}")
+    
+    print(f"\n📊 Combination Summary:")
+    print(f"   • Pairs from clusters: {pairs_from_clusters}")
+    print(f"   • Pairs from noise: {pairs_from_noise}")
+    print(f"   • Total combinations: {len(combo_universe)}")
     
     print(f"\n🧪 Testing {len(combo_universe)} combinations for cointegration...")
     print(f"   Alpha threshold: {alpha}")
@@ -356,6 +381,15 @@ def cluster_and_test_pairs(vector_universe, start_date, end_date, alpha=0.1, inc
     print(f"   ✅ Successfully tested: {success} combinations")
     print(f"   ❌ Failed tests: {failed} combinations")
     print(f"   🎯 Found {len(top_pairs)} cointegrated pairs/triplets with p-value ≤ {alpha}")
+    
+    if len(top_pairs) > 0:
+        print(f"\n🏆 Top 5 best pairs:")
+        sorted_pairs = sorted(top_pairs, key=lambda x: x[1])
+        for i, (pair, p_val) in enumerate(sorted_pairs[:5]):
+            if len(pair) == 2:
+                print(f"   {i+1}. {pair[0]} ↔ {pair[1]} (p={p_val:.6f})")
+            else:
+                print(f"   {i+1}. {' ↔ '.join(pair)} (p={p_val:.6f})")
     
     # Prepare cluster info for visualization
     cluster_info = {
@@ -504,6 +538,10 @@ card_style = {
 
 # App layout with tabs for better organization
 app.layout = dbc.Container([
+    # Hidden data store for pairs
+    dcc.Store(id='pairs-store', data=[]),
+    dcc.Store(id='analysis-complete', data=False),
+    
     # Header
     dbc.Row([
         dbc.Col([
@@ -579,6 +617,13 @@ app.layout = dbc.Container([
         ])
     ], style={'marginBottom': '20px'}),
     
+    # Status indicator
+    dbc.Row([
+        dbc.Col([
+            html.Div(id="status-indicator", style={'textAlign': 'center', 'marginBottom': '20px'})
+        ])
+    ]),
+    
     # Main Content with Tabs
     dbc.Row([
         dbc.Col([
@@ -607,35 +652,94 @@ app.layout = dbc.Container([
     
 ], fluid=True, style=custom_style)
 
-# Tab content callback
+# Update analysis callback - stores data in dcc.Store
 @callback(
-    Output("tab-content", "children"),
-    [Input("main-tabs", "value"),
-     Input('update-btn', 'n_clicks')],
+    [Output('pairs-store', 'data'),
+     Output('analysis-complete', 'data'),
+     Output('status-indicator', 'children')],
+    [Input('update-btn', 'n_clicks')],
     [dash.State('start-date', 'date'),
      dash.State('end-date', 'date'),
      dash.State('alpha-input', 'value'),
      dash.State('triplets-checkbox', 'value')]
 )
-def render_tab_content(active_tab, n_clicks, start_date, end_date, alpha, triplets_enabled):
-    # Initialize empty cluster data
-    cluster_info_div = [html.P("Click 'Run Analysis' to generate clusters", style={'color': colors['text'], 'textAlign': 'center'})]
-    cluster_fig = create_styled_figure()
-    cluster_fig.update_layout(title="Click 'Run Analysis' to see cluster visualization")
-    pair_options = []
+def run_analysis(n_clicks, start_date, end_date, alpha, triplets_enabled):
+    if not n_clicks or n_clicks == 0:
+        return [], False, html.P("Click 'Run Analysis' to start", style={'color': colors['text']})
     
-    # Only run analysis if button has been clicked
-    if n_clicks and n_clicks > 0:
+    # Show loading status
+    status = dbc.Alert([
+        dbc.Spinner(color="warning", size="sm"),
+        " Running analysis... This may take several minutes."
+    ], color="info", style={'textAlign': 'center'})
+    
+    try:
         include_triplets = 'enable' in triplets_enabled if triplets_enabled else False
         
         # Encode stock data
         vector_universe = encode_stock_data(encoder, start_date, end_date)
         
-        # Cluster and test pairs (and optionally triplets)
+        # Cluster and test pairs
         pairs_with_pvals, cluster_info = cluster_and_test_pairs(vector_universe, start_date, end_date, alpha, include_triplets)
         
-        # Prepare cluster information with enhanced styling
+        # Prepare pairs data for storage
+        pairs_data = {
+            'pairs_with_pvals': pairs_with_pvals,
+            'cluster_info': cluster_info,
+            'start_date': start_date,
+            'end_date': end_date,
+            'alpha': alpha
+        }
+        
+        success_status = dbc.Alert([
+            html.I(className="fas fa-check-circle"),
+            f" Analysis complete! Found {len(pairs_with_pvals)} cointegrated pairs."
+        ], color="success", style={'textAlign': 'center'})
+        
+        return pairs_data, True, success_status
+        
+    except Exception as e:
+        error_status = dbc.Alert([
+            html.I(className="fas fa-exclamation-triangle"),
+            f" Analysis failed: {str(e)}"
+        ], color="danger", style={'textAlign': 'center'})
+        
+        return [], False, error_status
+
+# Tab content callback
+@callback(
+    Output("tab-content", "children"),
+    [Input("main-tabs", "value"),
+     Input('pairs-store', 'data'),
+     Input('analysis-complete', 'data')]
+)
+def render_tab_content(active_tab, pairs_data, analysis_complete):
+    if active_tab == "clusters":
+        if not analysis_complete or not pairs_data:
+            return html.Div([
+                dbc.Row([
+                    dbc.Col([
+                        html.Div([
+                            html.H4("🎯 Cluster Information", style={'color': colors['text']}),
+                            html.P("Run analysis to see cluster information", style={'color': colors['text'], 'textAlign': 'center'})
+                        ], style=card_style)
+                    ], width=12)
+                ]),
+                dbc.Row([
+                    dbc.Col([
+                        html.Div([
+                            html.H4("🗺️ Cluster Visualization (PCA)", style={'color': colors['text']}),
+                            dcc.Graph(figure=create_styled_figure(), style={'height': '500px'})
+                        ], style=card_style)
+                    ], width=12)
+                ])
+            ])
+        
+        # Generate cluster information display
+        cluster_info = pairs_data['cluster_info']
         clusters = cluster_info.get('clusters', {})
+        pairs_with_pvals = pairs_data['pairs_with_pvals']
+        
         cluster_info_div = []
         
         total_pairs = len([pair for pair in pairs_with_pvals if len(pair[0]) == 2])
@@ -739,25 +843,12 @@ def render_tab_content(active_tab, n_clicks, start_date, end_date, alpha, triple
             height=500
         )
         
-        # Prepare dropdown options for pairs tab
-        for pair in pairs_with_pvals:
-            assets = pair[0]
-            p_val = pair[1]
-            if len(assets) == 2:
-                label = f"🔗 {assets[0]} ↔ {assets[1]} (p={p_val:.4f})"
-                value = f"{assets[0]}|{assets[1]}"
-            else:  # Triplets
-                label = f"🔺 {' ↔ '.join(assets)} (p={p_val:.4f})"
-                value = "|".join(assets)
-            pair_options.append({'label': label, 'value': value})
-    
-    if active_tab == "clusters":
         return html.Div([
             dbc.Row([
                 dbc.Col([
                     html.Div([
                         html.H4("🎯 Cluster Information", style={'color': colors['text']}),
-                        html.Div(cluster_info_div, id="cluster-info-content")
+                        html.Div(cluster_info_div)
                     ], style=card_style)
                 ], width=12)
             ]),
@@ -772,6 +863,33 @@ def render_tab_content(active_tab, n_clicks, start_date, end_date, alpha, triple
         ])
     
     elif active_tab == "pairs":
+        if not analysis_complete or not pairs_data:
+            return html.Div([
+                dbc.Row([
+                    dbc.Col([
+                        html.Div([
+                            html.H4("📋 Select Trading Pair", style={'color': colors['text']}),
+                            html.P("Run analysis first to see available pairs", style={'color': colors['text'], 'textAlign': 'center'})
+                        ], style=card_style)
+                    ], width=12)
+                ])
+            ])
+        
+        # Prepare dropdown options
+        pairs_with_pvals = pairs_data['pairs_with_pvals']
+        pair_options = []
+        
+        for pair in pairs_with_pvals:
+            assets = pair[0]
+            p_val = pair[1]
+            if len(assets) == 2:
+                label = f"🔗 {assets[0]} ↔ {assets[1]} (p={p_val:.4f})"
+                value = f"{assets[0]}|{assets[1]}"
+            else:  # Triplets
+                label = f"🔺 {' ↔ '.join(assets)} (p={p_val:.4f})"
+                value = "|".join(assets)
+            pair_options.append({'label': label, 'value': value})
+        
         return html.Div([
             dbc.Row([
                 dbc.Col([
@@ -817,19 +935,20 @@ def render_tab_content(active_tab, n_clicks, start_date, end_date, alpha, triple
      Output('2d-plot', 'figure'),
      Output('spread-plot', 'figure')],
     [Input('pair-dropdown', 'value')],
-    [dash.State('start-date', 'date'),
-     dash.State('end-date', 'date')]
+    [dash.State('pairs-store', 'data')]
 )
-def update_pair_analysis(selected_pair, start_date, end_date):
+def update_pair_analysis(selected_pair, pairs_data):
     empty_fig = create_styled_figure()
     
-    if not selected_pair:
+    if not selected_pair or not pairs_data:
         return html.P("🔍 Select a pair to analyze", style={'color': colors['text'], 'textAlign': 'center'}), empty_fig, empty_fig
     
     # Parse selected assets (can be pair or triplet)
     assets = selected_pair.split('|')
     
     # Get data for all assets
+    start_date = pairs_data['start_date']
+    end_date = pairs_data['end_date']
     pair_data = get_pair_data(assets, start_date, end_date)
     
     if len(pair_data) < 2:
