@@ -17,6 +17,30 @@ from statsmodels.tsa.vector_ar.vecm import coint_johansen
 from tqdm import tqdm
 from sklearn.linear_model import LinearRegression
 from sklearn.decomposition import PCA
+import logging
+import warnings
+import tensorflow as tf
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+# Suppress TensorFlow warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TF debugging logs
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', category=UserWarning)
+
+# Suppress specific TensorFlow messages
+tf.get_logger().setLevel('ERROR')
+
+def print_section_header(title):
+    """Print a formatted section header"""
+    print("\n" + "="*80)
+    print(f"🚀 {title}")
+    print("="*80)
 
 # Configuration Constants
 BACKGROUND_COLOR = 'black'  # Change this to modify dashboard background
@@ -152,41 +176,65 @@ def encode_stock_data(encoder, start_date, end_date):
     Encode stock data using the saved encoder
     Returns vector_universe: dict of stock_name: encoded_vectors
     """
+    print_section_header("LOADING AND ENCODING STOCK DATA")
+    print(f"📅 Analysis Period: {start_date} to {end_date}")
+    
     if not os.path.exists(DIRECTORY):
-        print(f"Error: Directory {DIRECTORY} not found.")
+        logging.error(f"Directory {DIRECTORY} not found.")
+        print("❌ Error: Stock data directory not found!")
+        print(f"   Looked in: {DIRECTORY}")
         return {}
     
     files = [f for f in os.listdir(DIRECTORY) if os.path.isfile(os.path.join(DIRECTORY, f))]
-    vector_universe = {} 
+    total_files = len(files)
+    print(f"\n📊 Found {total_files} stock files to process")
+    
+    vector_universe = {}
+    processed = 0
+    skipped = 0
+    errors = 0
     
     for file_name in files:
         try:
+            processed += 1
+            print(f"\n🔄 Processing {file_name} ({processed}/{total_files})")
+            
             df = pd.read_csv(os.path.join(DIRECTORY, file_name), index_col=0)
             df = df[start_date:end_date]
             df_price = df['Close']
             
             if len(df_price) < LOOKBACK * 3:
-                print(f'COULD NOT EVAL {file_name}: {len(df_price)}') 
+                print(f"⚠️  Skipping {file_name}: Insufficient data ({len(df_price)} points, need {LOOKBACK * 3})")
+                skipped += 1
                 continue
-                
-            print(f"Processing {file_name} {len(df_price)}") 
             
-            # Rolling z-score (same as original)
+            # Rolling z-score calculation
+            print(f"   📈 Calculating rolling statistics...")
             rolling_mean = df_price.rolling(window=LOOKBACK).mean()
             rolling_std = df_price.rolling(window=LOOKBACK).std()
             rolling_zscore = (df_price - rolling_mean) / rolling_std
             rolling_zscore = rolling_zscore.dropna(how='all').to_list()
             
+            print(f"   🪟 Creating sliding windows...")
             x = stride_window(STRIDE, rolling_zscore, LOOKBACK)
             
-            # Encode using the loaded encoder
+            print(f"   🧠 Encoding with autoencoder...")
             stock_name = ''.join([letter for letter in file_name if letter.isupper()])
-            stock_vect = encoder.predict(x).squeeze()
+            stock_vect = encoder.predict(x, verbose=0).squeeze()
             vector_universe[stock_name] = stock_vect.tolist()
             
+            print(f"   ✅ Successfully encoded {stock_name}")
+            
         except Exception as e:
-            print(f"Error processing {file_name}: {e}")
+            print(f"❌ Error processing {file_name}: {str(e)}")
+            errors += 1
             continue
+    
+    print("\n📊 Encoding Summary:")
+    print(f"   ✅ Successfully processed: {len(vector_universe)} stocks")
+    print(f"   ⚠️  Skipped (insufficient data): {skipped} stocks")
+    print(f"   ❌ Errors: {errors} stocks")
+    print(f"   📈 Total processed: {processed} stocks")
     
     return vector_universe
 
@@ -195,18 +243,23 @@ def cluster_and_test_pairs(vector_universe, start_date, end_date, alpha=0.1, inc
     Cluster encoded vectors and test cointegration for pairs (and optionally triplets)
     Returns: (pairs_with_pvals, cluster_info)
     """
+    print_section_header("CLUSTERING AND COINTEGRATION ANALYSIS")
+    
     if not vector_universe:
+        print("❌ No encoded stock data available!")
         return [], {}
     
+    print("🔍 Preparing data for clustering...")
     cluster_model = HDBSCAN(min_cluster_size=6)
     data_labels = list(vector_universe.keys())
     vector_data = list(vector_universe.values())
     
-    # Flatten and pad vectors (same as original)
+    print("📊 Flattening and padding vectors...")
     flatten_to_2d = lambda data: [[i for sub in ([el] if not isinstance(el, list) else el) for i in (sub if not isinstance(sub, list) else [x for x in sub])] if not isinstance(item, list) else [i for sub in item for i in (sub if not isinstance(sub, list) else [x for x in sub])] for item in data]
     pad = lambda lst: [x + [0] * (max(map(len, lst)) - len(x)) for x in lst]
     vector_data = pad(flatten_to_2d(vector_data))
     
+    print("\n🧮 Running HDBSCAN clustering...")
     cluster_set = cluster_model.fit_predict(vector_data).tolist()
     
     VECTOR_CLUSTER = dict(zip(data_labels, cluster_set))
@@ -220,7 +273,7 @@ def cluster_and_test_pairs(vector_universe, start_date, end_date, alpha=0.1, inc
         else:
             sorted_clusters[value].append(key)
     
-    # Print cluster information before cointegration testing
+    # Print cluster information
     print("\n" + "="*60)
     print("🔍 CLUSTER ANALYSIS RESULTS")
     print("="*60)
@@ -231,22 +284,23 @@ def cluster_and_test_pairs(vector_universe, start_date, end_date, alpha=0.1, inc
     for cluster_id in sorted(sorted_clusters.keys()):
         stocks = sorted_clusters[cluster_id]
         if cluster_id == -1:
-            print(f"🔸 Noise (Cluster {cluster_id}): {len(stocks)} stocks")
+            print(f"\n🔸 Noise (Cluster {cluster_id}): {len(stocks)} stocks")
             print(f"   Stocks: {', '.join(stocks[:10])}{'...' if len(stocks) > 10 else ''}")
         else:
-            print(f"📊 Cluster {cluster_id}: {len(stocks)} stocks")
+            print(f"\n📊 Cluster {cluster_id}: {len(stocks)} stocks")
             print(f"   Stocks: {', '.join(stocks)}")
             total_clustered += len(stocks)
             valid_clusters += 1
     
-    print(f"\n📈 Summary:")
+    print(f"\n📈 Clustering Summary:")
     print(f"   • Total valid clusters: {valid_clusters}")
     print(f"   • Total stocks in clusters: {total_clustered}")
     print(f"   • Noise points: {len(sorted_clusters.get(-1, []))}")
     print(f"   • Total stocks processed: {len(data_labels)}")
-    print("="*60 + "\n")
+    print("="*60)
     
-    # Generate pairs (and optionally triplets) from clusters
+    # Generate combinations
+    print("\n🔄 Generating stock combinations...")
     for key, lst in sorted_clusters.items():
         if len(lst) >= 2:
             # Generate pairs
@@ -254,17 +308,22 @@ def cluster_and_test_pairs(vector_universe, start_date, end_date, alpha=0.1, inc
             for item in pairs:
                 combo_universe.append(item)
             
-            # Generate triplets if requested and cluster is large enough
+            # Generate triplets if requested
             if include_triplets and len(lst) >= 3:
+                print(f"   📈 Generating triplets for cluster {key} ({len(lst)} stocks)")
                 triplets = list(combinations(lst, 3))
                 for item in triplets:
                     combo_universe.append(item)
     
-    print(f"🧪 Testing {len(combo_universe)} combinations for cointegration...")
+    print(f"\n🧪 Testing {len(combo_universe)} combinations for cointegration...")
+    print(f"   Alpha threshold: {alpha}")
     
-    # Test cointegration for all combinations
+    # Test cointegration
     final_p_vals = {}
-    files = [f for f in os.listdir(DIRECTORY) if os.path.isfile(os.path.join(DIRECTORY, f))]   
+    files = [f for f in os.listdir(DIRECTORY) if os.path.isfile(os.path.join(DIRECTORY, f))]
+    
+    success = 0
+    failed = 0
     
     for assets in tqdm(combo_universe, desc="Testing cointegration"):
         try:
@@ -278,22 +337,25 @@ def cluster_and_test_pairs(vector_universe, start_date, end_date, alpha=0.1, inc
                 df.index = pd.to_datetime(df.index)
                 asset_data[name] = df.Close.to_list() 
             
-            if len(asset_data) >= 2:  # Support both pairs and triplets
+            if len(asset_data) >= 2:
                 result = multi_cointegration_test(asset_data)
                 if len(asset_data) == 2:
                     p_val = result['p_value']
-                else:  # Triplets or more - use Johansen test result
-                    # For Johansen test, we'll use the trace statistic comparison
-                    # A more sophisticated approach would be needed for production
+                else:
                     p_val = 0.05 if result['cointegration_rank'] > 0 else 1.0
-                final_p_vals[assets] = p_val 
+                final_p_vals[assets] = p_val
+                success += 1
         except Exception as e:
-            print(f"Error testing {assets}: {e}")
+            print(f"\n❌ Error testing {assets}: {str(e)}")
+            failed += 1
             continue
     
     top_pairs = [(item[0], item[1]) for item in final_p_vals.items() if item[1] <= alpha]
     
-    print(f"✅ Found {len(top_pairs)} cointegrated pairs with p-value ≤ {alpha}")
+    print("\n📊 Cointegration Testing Results:")
+    print(f"   ✅ Successfully tested: {success} combinations")
+    print(f"   ❌ Failed tests: {failed} combinations")
+    print(f"   🎯 Found {len(top_pairs)} cointegrated pairs/triplets with p-value ≤ {alpha}")
     
     # Prepare cluster info for visualization
     cluster_info = {
