@@ -548,16 +548,154 @@ app.layout = dbc.Container([
 # Tab content callback
 @callback(
     Output("tab-content", "children"),
-    [Input("main-tabs", "value")]
+    [Input("main-tabs", "value"),
+     Input('update-btn', 'n_clicks')],
+    [dash.State('start-date', 'date'),
+     dash.State('end-date', 'date'),
+     dash.State('alpha-input', 'value'),
+     dash.State('triplets-checkbox', 'value')]
 )
-def render_tab_content(active_tab):
+def render_tab_content(active_tab, n_clicks, start_date, end_date, alpha, triplets_enabled):
+    # Initialize empty cluster data
+    cluster_info_div = [html.P("Click 'Run Analysis' to generate clusters", style={'color': colors['text'], 'textAlign': 'center'})]
+    cluster_fig = create_styled_figure()
+    cluster_fig.update_layout(title="Click 'Run Analysis' to see cluster visualization")
+    pair_options = []
+    
+    # Only run analysis if button has been clicked
+    if n_clicks and n_clicks > 0:
+        include_triplets = 'enable' in triplets_enabled if triplets_enabled else False
+        
+        # Encode stock data
+        vector_universe = encode_stock_data(encoder, start_date, end_date)
+        
+        # Cluster and test pairs (and optionally triplets)
+        pairs_with_pvals, cluster_info = cluster_and_test_pairs(vector_universe, start_date, end_date, alpha, include_triplets)
+        
+        # Prepare cluster information with enhanced styling
+        clusters = cluster_info.get('clusters', {})
+        cluster_info_div = []
+        
+        total_pairs = len([pair for pair in pairs_with_pvals if len(pair[0]) == 2])
+        total_triplets = len([pair for pair in pairs_with_pvals if len(pair[0]) == 3])
+        
+        # Summary card
+        cluster_info_div.append(
+            html.Div([
+                html.H5("📊 Analysis Summary", style={'color': colors['success'], 'marginBottom': '15px'}),
+                dbc.Row([
+                    dbc.Col([
+                        html.Div([
+                            html.H3(f"{len([c for c in clusters.keys() if c != -1])}", style={'color': colors['accent'], 'margin': 0}),
+                            html.P("Valid Clusters", style={'color': colors['text'], 'margin': 0})
+                        ], style={'textAlign': 'center'})
+                    ], width=3),
+                    dbc.Col([
+                        html.Div([
+                            html.H3(f"{total_pairs}", style={'color': colors['success'], 'margin': 0}),
+                            html.P("Cointegrated Pairs", style={'color': colors['text'], 'margin': 0})
+                        ], style={'textAlign': 'center'})
+                    ], width=3),
+                    dbc.Col([
+                        html.Div([
+                            html.H3(f"{total_triplets}", style={'color': colors['info'], 'margin': 0}),
+                            html.P("Cointegrated Triplets", style={'color': colors['text'], 'margin': 0})
+                        ], style={'textAlign': 'center'})
+                    ], width=3),
+                    dbc.Col([
+                        html.Div([
+                            html.H3(f"{len(clusters.get(-1, []))}", style={'color': colors['warning'], 'margin': 0}),
+                            html.P("Noise Points", style={'color': colors['text'], 'margin': 0})
+                        ], style={'textAlign': 'center'})
+                    ], width=3)
+                ])
+            ], style={'backgroundColor': 'rgba(0,255,127,0.1)', 'padding': '20px', 'borderRadius': '10px', 'marginBottom': '20px'})
+        )
+        
+        # Individual cluster cards
+        for cluster_id in sorted([c for c in clusters.keys() if c != -1]):
+            stocks = clusters[cluster_id]
+            cluster_info_div.append(
+                html.Div([
+                    html.H6(f"🎯 Cluster {cluster_id}", style={'color': colors['accent'], 'marginBottom': '10px'}),
+                    html.P(f"📊 {len(stocks)} stocks", style={'color': colors['text'], 'marginBottom': '5px'}),
+                    html.P(f"📈 {', '.join(stocks)}", style={'color': colors['info'], 'fontSize': '0.9rem'})
+                ], style={
+                    'backgroundColor': 'rgba(255,165,0,0.1)', 
+                    'padding': '15px', 
+                    'borderRadius': '8px', 
+                    'marginBottom': '10px',
+                    'border': f'1px solid {colors["accent"]}'
+                })
+            )
+        
+        # Generate cluster visualization
+        cluster_fig = create_styled_figure()
+        
+        if cluster_info.get('vector_data'):
+            # Apply PCA for 2D visualization
+            pca = PCA(n_components=2)
+            vector_2d = pca.fit_transform(cluster_info['vector_data'])
+            
+            # Color by cluster with enhanced palette
+            unique_clusters = set(cluster_info['cluster_assignments'])
+            colors_list = px.colors.qualitative.Set3
+            
+            for i, cluster_id in enumerate(unique_clusters):
+                mask = [c == cluster_id for c in cluster_info['cluster_assignments']]
+                cluster_data = vector_2d[np.array(mask)]
+                cluster_labels = [cluster_info['labels'][j] for j, m in enumerate(mask) if m]
+                
+                color = colors_list[i % len(colors_list)] if cluster_id != -1 else '#666666'
+                name = f"Cluster {cluster_id}" if cluster_id != -1 else "Noise"
+                
+                cluster_fig.add_trace(go.Scatter(
+                    x=cluster_data[:, 0],
+                    y=cluster_data[:, 1],
+                    mode='markers+text',
+                    text=cluster_labels,
+                    textposition='top center',
+                    textfont=dict(size=8, color='white'),
+                    marker=dict(
+                        color=color, 
+                        size=12,
+                        line=dict(width=1, color='white'),
+                        opacity=0.8
+                    ),
+                    name=name,
+                    hovertemplate='<b>%{text}</b><br>PC1: %{x:.2f}<br>PC2: %{y:.2f}<extra></extra>'
+                ))
+        
+        cluster_fig.update_layout(
+            title=dict(
+                text="Stock Clusters in Latent Space (PCA Projection)",
+                x=0.5,
+                font=dict(size=18, color=colors['text'])
+            ),
+            xaxis_title="First Principal Component",
+            yaxis_title="Second Principal Component",
+            height=500
+        )
+        
+        # Prepare dropdown options for pairs tab
+        for pair in pairs_with_pvals:
+            assets = pair[0]
+            p_val = pair[1]
+            if len(assets) == 2:
+                label = f"🔗 {assets[0]} ↔ {assets[1]} (p={p_val:.4f})"
+                value = f"{assets[0]}|{assets[1]}"
+            else:  # Triplets
+                label = f"🔺 {' ↔ '.join(assets)} (p={p_val:.4f})"
+                value = "|".join(assets)
+            pair_options.append({'label': label, 'value': value})
+    
     if active_tab == "clusters":
         return html.Div([
             dbc.Row([
                 dbc.Col([
                     html.Div([
                         html.H4("🎯 Cluster Information", style={'color': colors['text']}),
-                        html.Div(id="cluster-info")
+                        html.Div(cluster_info_div, id="cluster-info-content")
                     ], style=card_style)
                 ], width=12)
             ]),
@@ -565,7 +703,7 @@ def render_tab_content(active_tab):
                 dbc.Col([
                     html.Div([
                         html.H4("🗺️ Cluster Visualization (PCA)", style={'color': colors['text']}),
-                        dcc.Graph(id="cluster-plot", style={'height': '500px'})
+                        dcc.Graph(figure=cluster_fig, style={'height': '500px'})
                     ], style=card_style)
                 ], width=12)
             ])
@@ -579,6 +717,8 @@ def render_tab_content(active_tab):
                         html.H4("📋 Select Trading Pair", style={'color': colors['text']}),
                         dcc.Dropdown(
                             id='pair-dropdown',
+                            options=pair_options,
+                            value=pair_options[0]['value'] if pair_options else None,
                             placeholder="Choose a cointegrated pair...",
                             style={'backgroundColor': colors['secondary'], 'color': 'black'}
                         )
@@ -594,7 +734,7 @@ def render_tab_content(active_tab):
                 ], width=4),
                 dbc.Col([
                     html.Div([
-                        html.H4("🎯 Price Relationship", style={'color': colors['text']}),
+                        html.H4("🎯 Stock1 × Stock2 Relationship", style={'color': colors['text']}),
                         dcc.Graph(id="2d-plot", style={'height': '400px'})
                     ], style=card_style)
                 ], width=8)
@@ -609,152 +749,7 @@ def render_tab_content(active_tab):
             ])
         ])
 
-# Callbacks
-@callback(
-    [Output('pair-dropdown', 'options'),
-     Output('pair-dropdown', 'value'),
-     Output('cluster-info', 'children'),
-     Output('cluster-plot', 'figure')],
-    [Input('update-btn', 'n_clicks')],
-    [dash.State('start-date', 'date'),
-     dash.State('end-date', 'date'),
-     dash.State('alpha-input', 'value'),
-     dash.State('triplets-checkbox', 'value')]
-)
-def update_analysis(n_clicks, start_date, end_date, alpha, triplets_enabled):
-    if n_clicks is None:
-        n_clicks = 1  # Initial load
-    
-    include_triplets = 'enable' in triplets_enabled if triplets_enabled else False
-    
-    # Encode stock data
-    vector_universe = encode_stock_data(encoder, start_date, end_date)
-    
-    # Cluster and test pairs (and optionally triplets)
-    pairs_with_pvals, cluster_info = cluster_and_test_pairs(vector_universe, start_date, end_date, alpha, include_triplets)
-    
-    # Prepare dropdown options
-    pair_options = []
-    for pair in pairs_with_pvals:
-        assets = pair[0]
-        p_val = pair[1]
-        if len(assets) == 2:
-            label = f"🔗 {assets[0]} ↔ {assets[1]} (p={p_val:.4f})"
-            value = f"{assets[0]}|{assets[1]}"
-        else:  # Triplets
-            label = f"🔺 {' ↔ '.join(assets)} (p={p_val:.4f})"
-            value = "|".join(assets)
-        pair_options.append({'label': label, 'value': value})
-    
-    selected_pair = pair_options[0]['value'] if pair_options else None
-    
-    # Cluster information with enhanced styling
-    clusters = cluster_info.get('clusters', {})
-    cluster_info_div = []
-    
-    total_pairs = len([pair for pair in pairs_with_pvals if len(pair[0]) == 2])
-    total_triplets = len([pair for pair in pairs_with_pvals if len(pair[0]) == 3])
-    
-    # Summary card
-    cluster_info_div.append(
-        html.Div([
-            html.H5("📊 Analysis Summary", style={'color': colors['success'], 'marginBottom': '15px'}),
-            dbc.Row([
-                dbc.Col([
-                    html.Div([
-                        html.H3(f"{len([c for c in clusters.keys() if c != -1])}", style={'color': colors['accent'], 'margin': 0}),
-                        html.P("Valid Clusters", style={'color': colors['text'], 'margin': 0})
-                    ], style={'textAlign': 'center'})
-                ], width=3),
-                dbc.Col([
-                    html.Div([
-                        html.H3(f"{total_pairs}", style={'color': colors['success'], 'margin': 0}),
-                        html.P("Cointegrated Pairs", style={'color': colors['text'], 'margin': 0})
-                    ], style={'textAlign': 'center'})
-                ], width=3),
-                dbc.Col([
-                    html.Div([
-                        html.H3(f"{total_triplets}", style={'color': colors['info'], 'margin': 0}),
-                        html.P("Cointegrated Triplets", style={'color': colors['text'], 'margin': 0})
-                    ], style={'textAlign': 'center'})
-                ], width=3),
-                dbc.Col([
-                    html.Div([
-                        html.H3(f"{len(clusters.get(-1, []))}", style={'color': colors['warning'], 'margin': 0}),
-                        html.P("Noise Points", style={'color': colors['text'], 'margin': 0})
-                    ], style={'textAlign': 'center'})
-                ], width=3)
-            ])
-        ], style={'backgroundColor': 'rgba(0,255,127,0.1)', 'padding': '20px', 'borderRadius': '10px', 'marginBottom': '20px'})
-    )
-    
-    # Individual cluster cards
-    for cluster_id in sorted([c for c in clusters.keys() if c != -1]):
-        stocks = clusters[cluster_id]
-        cluster_info_div.append(
-            html.Div([
-                html.H6(f"🎯 Cluster {cluster_id}", style={'color': colors['accent'], 'marginBottom': '10px'}),
-                html.P(f"📊 {len(stocks)} stocks", style={'color': colors['text'], 'marginBottom': '5px'}),
-                html.P(f"📈 {', '.join(stocks)}", style={'color': colors['info'], 'fontSize': '0.9rem'})
-            ], style={
-                'backgroundColor': 'rgba(255,165,0,0.1)', 
-                'padding': '15px', 
-                'borderRadius': '8px', 
-                'marginBottom': '10px',
-                'border': f'1px solid {colors["accent"]}'
-            })
-        )
-    
-    # Cluster visualization using PCA with enhanced styling
-    cluster_fig = create_styled_figure()
-    
-    if cluster_info.get('vector_data'):
-        # Apply PCA for 2D visualization
-        pca = PCA(n_components=2)
-        vector_2d = pca.fit_transform(cluster_info['vector_data'])
-        
-        # Color by cluster with enhanced palette
-        unique_clusters = set(cluster_info['cluster_assignments'])
-        colors_list = px.colors.qualitative.Set3
-        
-        for i, cluster_id in enumerate(unique_clusters):
-            mask = [c == cluster_id for c in cluster_info['cluster_assignments']]
-            cluster_data = vector_2d[np.array(mask)]
-            cluster_labels = [cluster_info['labels'][j] for j, m in enumerate(mask) if m]
-            
-            color = colors_list[i % len(colors_list)] if cluster_id != -1 else '#666666'
-            name = f"Cluster {cluster_id}" if cluster_id != -1 else "Noise"
-            
-            cluster_fig.add_trace(go.Scatter(
-                x=cluster_data[:, 0],
-                y=cluster_data[:, 1],
-                mode='markers+text',
-                text=cluster_labels,
-                textposition='top center',
-                textfont=dict(size=8, color='white'),
-                marker=dict(
-                    color=color, 
-                    size=12,
-                    line=dict(width=1, color='white'),
-                    opacity=0.8
-                ),
-                name=name,
-                hovertemplate='<b>%{text}</b><br>PC1: %{x:.2f}<br>PC2: %{y:.2f}<extra></extra>'
-            ))
-    
-    cluster_fig.update_layout(
-        title=dict(
-            text="Stock Clusters in Latent Space (PCA Projection)",
-            x=0.5,
-            font=dict(size=18, color=colors['text'])
-        ),
-        xaxis_title="First Principal Component",
-        yaxis_title="Second Principal Component",
-        height=500
-    )
-    
-    return pair_options, selected_pair, cluster_info_div, cluster_fig
-
+# Simplified callback for pair analysis only
 @callback(
     [Output('pair-stats', 'children'),
      Output('2d-plot', 'figure'),
