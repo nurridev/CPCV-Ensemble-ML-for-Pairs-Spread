@@ -220,6 +220,32 @@ def cluster_and_test_pairs(vector_universe, start_date, end_date, alpha=0.1, inc
         else:
             sorted_clusters[value].append(key)
     
+    # Print cluster information before cointegration testing
+    print("\n" + "="*60)
+    print("🔍 CLUSTER ANALYSIS RESULTS")
+    print("="*60)
+    
+    total_clustered = 0
+    valid_clusters = 0
+    
+    for cluster_id in sorted(sorted_clusters.keys()):
+        stocks = sorted_clusters[cluster_id]
+        if cluster_id == -1:
+            print(f"🔸 Noise (Cluster {cluster_id}): {len(stocks)} stocks")
+            print(f"   Stocks: {', '.join(stocks[:10])}{'...' if len(stocks) > 10 else ''}")
+        else:
+            print(f"📊 Cluster {cluster_id}: {len(stocks)} stocks")
+            print(f"   Stocks: {', '.join(stocks)}")
+            total_clustered += len(stocks)
+            valid_clusters += 1
+    
+    print(f"\n📈 Summary:")
+    print(f"   • Total valid clusters: {valid_clusters}")
+    print(f"   • Total stocks in clusters: {total_clustered}")
+    print(f"   • Noise points: {len(sorted_clusters.get(-1, []))}")
+    print(f"   • Total stocks processed: {len(data_labels)}")
+    print("="*60 + "\n")
+    
     # Generate pairs (and optionally triplets) from clusters
     for key, lst in sorted_clusters.items():
         if len(lst) >= 2:
@@ -233,6 +259,8 @@ def cluster_and_test_pairs(vector_universe, start_date, end_date, alpha=0.1, inc
                 triplets = list(combinations(lst, 3))
                 for item in triplets:
                     combo_universe.append(item)
+    
+    print(f"🧪 Testing {len(combo_universe)} combinations for cointegration...")
     
     # Test cointegration for all combinations
     final_p_vals = {}
@@ -264,6 +292,8 @@ def cluster_and_test_pairs(vector_universe, start_date, end_date, alpha=0.1, inc
             continue
     
     top_pairs = [(item[0], item[1]) for item in final_p_vals.items() if item[1] <= alpha]
+    
+    print(f"✅ Found {len(top_pairs)} cointegrated pairs with p-value ≤ {alpha}")
     
     # Prepare cluster info for visualization
     cluster_info = {
@@ -336,6 +366,42 @@ def calculate_spread_and_stats(pair_data, split_ratio=0.2):
         'stocks': stocks
     }
 
+def create_styled_figure():
+    """Create a standardized plotly figure with consistent styling"""
+    fig = go.Figure()
+    fig.update_layout(
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(20,20,20,0.8)',
+        font=dict(
+            family="Arial, sans-serif",
+            size=12,
+            color='#FFD700'
+        ),
+        title_font=dict(
+            size=16,
+            color='#FFD700'
+        ),
+        margin=dict(l=60, r=60, t=60, b=60),
+        hovermode='closest',
+        showlegend=True,
+        legend=dict(
+            bgcolor='rgba(0,0,0,0.5)',
+            bordercolor='#FFD700',
+            borderwidth=1
+        ),
+        xaxis=dict(
+            gridcolor='rgba(255,215,0,0.2)',
+            zerolinecolor='rgba(255,215,0,0.3)',
+            color='#FFD700'
+        ),
+        yaxis=dict(
+            gridcolor='rgba(255,215,0,0.2)',
+            zerolinecolor='rgba(255,215,0,0.3)',
+            color='#FFD700'
+        )
+    )
+    return fig
+
 # Initialize the Dash app
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
 
@@ -345,112 +411,203 @@ if encoder is None:
     print("Cannot proceed without encoder. Exiting.")
     exit(1)
 
-# Define color scheme
+# Define enhanced color scheme
 colors = {
     'background': BACKGROUND_COLOR,
     'text': '#FFD700',  # Gold/Yellow
-    'secondary': '#333333',
+    'secondary': '#1a1a1a',
     'accent': '#FFA500',  # Orange
-    'success': '#00FF00',  # Green
-    'warning': '#FF6600'   # Red-Orange
+    'success': '#00FF7F',  # Spring Green
+    'warning': '#FF6347',   # Tomato
+    'info': '#40E0D0',     # Turquoise
+    'card_bg': 'rgba(26,26,26,0.9)',
+    'border': 'rgba(255,215,0,0.3)'
 }
 
-# App layout
+# Custom CSS styling
+custom_style = {
+    'backgroundColor': colors['background'],
+    'minHeight': '100vh',
+    'fontFamily': 'Arial, sans-serif'
+}
+
+card_style = {
+    'backgroundColor': colors['card_bg'],
+    'border': f'1px solid {colors["border"]}',
+    'borderRadius': '10px',
+    'padding': '20px',
+    'margin': '10px 0',
+    'boxShadow': '0 4px 8px rgba(255,215,0,0.1)'
+}
+
+# App layout with tabs for better organization
 app.layout = dbc.Container([
+    # Header
     dbc.Row([
         dbc.Col([
-            html.H1("Autoencoder Pairs Trading Dashboard", 
-                   style={'textAlign': 'center', 'color': colors['text'], 'marginBottom': 30})
+            html.Div([
+                html.H1("⚡ Autoencoder Pairs Trading Dashboard", 
+                       style={
+                           'textAlign': 'center', 
+                           'color': colors['text'], 
+                           'marginBottom': '10px',
+                           'fontSize': '2.5rem',
+                           'fontWeight': 'bold'
+                       }),
+                html.P("AI-Powered Statistical Arbitrage Analysis", 
+                      style={
+                          'textAlign': 'center', 
+                          'color': colors['accent'], 
+                          'fontSize': '1.2rem',
+                          'marginBottom': '30px'
+                      })
+            ], style=card_style)
         ])
     ]),
     
+    # Control Panel
     dbc.Row([
         dbc.Col([
-            html.Label("Start Date:", style={'color': colors['text']}),
-            dcc.DatePickerSingle(
-                id='start-date',
-                date='2014-01-01',
-                style={'width': '100%'}
-            )
-        ], width=3),
-        dbc.Col([
-            html.Label("End Date:", style={'color': colors['text']}),
-            dcc.DatePickerSingle(
-                id='end-date',
-                date='2020-01-01',
-                style={'width': '100%'}
-            )
-        ], width=2),
-        dbc.Col([
-            html.Label("Alpha (p-value threshold):", style={'color': colors['text']}),
-            dcc.Input(
-                id='alpha-input',
-                type='number',
-                value=0.1,
-                min=0.01,
-                max=1.0,
-                step=0.01,
-                style={'width': '100%'}
-            )
-        ], width=2),
-        dbc.Col([
-            html.Label("Include Triplets:", style={'color': colors['text']}),
-            dcc.Checklist(
-                id='triplets-checkbox',
-                options=[{'label': ' Enable', 'value': 'enable'}],
-                value=[],
-                style={'color': colors['text'], 'marginTop': '5px'}
-            )
-        ], width=2),
-        dbc.Col([
-            dbc.Button("Update Analysis", id="update-btn", color="warning", 
-                      style={'marginTop': 25, 'width': '100%'})
-        ], width=3)
-    ], style={'marginBottom': 30}),
+            html.Div([
+                html.H4("🎛️ Analysis Parameters", style={'color': colors['text'], 'marginBottom': '20px'}),
+                dbc.Row([
+                    dbc.Col([
+                        html.Label("Start Date", style={'color': colors['text'], 'fontWeight': 'bold'}),
+                        dcc.DatePickerSingle(
+                            id='start-date',
+                            date='2014-01-01',
+                            style={'width': '100%'}
+                        )
+                    ], width=2),
+                    dbc.Col([
+                        html.Label("End Date", style={'color': colors['text'], 'fontWeight': 'bold'}),
+                        dcc.DatePickerSingle(
+                            id='end-date',
+                            date='2020-01-01',
+                            style={'width': '100%'}
+                        )
+                    ], width=2),
+                    dbc.Col([
+                        html.Label("Alpha Threshold", style={'color': colors['text'], 'fontWeight': 'bold'}),
+                        dcc.Input(
+                            id='alpha-input',
+                            type='number',
+                            value=0.1,
+                            min=0.01,
+                            max=1.0,
+                            step=0.01,
+                            style={'width': '100%', 'backgroundColor': colors['secondary'], 'color': colors['text']}
+                        )
+                    ], width=2),
+                    dbc.Col([
+                        html.Label("Triplets", style={'color': colors['text'], 'fontWeight': 'bold'}),
+                        dcc.Checklist(
+                            id='triplets-checkbox',
+                            options=[{'label': ' Enable', 'value': 'enable'}],
+                            value=[],
+                            style={'color': colors['text'], 'marginTop': '8px'}
+                        )
+                    ], width=2),
+                    dbc.Col([
+                        dbc.Button("🚀 Run Analysis", id="update-btn", color="warning", size="lg",
+                                  style={'marginTop': '25px', 'width': '100%', 'fontWeight': 'bold'})
+                    ], width=4)
+                ])
+            ], style=card_style)
+        ])
+    ], style={'marginBottom': '20px'}),
     
+    # Main Content with Tabs
     dbc.Row([
         dbc.Col([
-            html.H3("Cluster Information", style={'color': colors['text']}),
-            html.Div(id="cluster-info")
-        ], width=12)
-    ], style={'marginBottom': 20}),
-    
-    dbc.Row([
-        dbc.Col([
-            html.H3("Cluster Visualization", style={'color': colors['text']}),
-            dcc.Graph(id="cluster-plot")
-        ], width=12)
-    ], style={'marginBottom': 30}),
-    
-    dbc.Row([
-        dbc.Col([
-            html.Label("Select Pair:", style={'color': colors['text']}),
-            dcc.Dropdown(
-                id='pair-dropdown',
-                style={'color': 'black'}
-            )
-        ], width=12)
-    ], style={'marginBottom': 20}),
-    
-    dbc.Row([
-        dbc.Col([
-            html.H3("Pair Statistics", style={'color': colors['text']}),
-            html.Div(id="pair-stats")
-        ], width=6),
-        dbc.Col([
-            html.H3("2D Stock Relationship", style={'color': colors['text']}),
-            dcc.Graph(id="2d-plot")
-        ], width=6)
-    ], style={'marginBottom': 30}),
-    
-    dbc.Row([
-        dbc.Col([
-            html.H3("Spread Analysis", style={'color': colors['text']}),
-            dcc.Graph(id="spread-plot")
-        ], width=12)
+            dcc.Tabs(
+                id="main-tabs",
+                value="clusters",
+                children=[
+                    dcc.Tab(
+                        label="📊 Cluster Analysis",
+                        value="clusters",
+                        style={'backgroundColor': colors['secondary'], 'color': colors['text']},
+                        selected_style={'backgroundColor': colors['accent'], 'color': 'black'}
+                    ),
+                    dcc.Tab(
+                        label="💰 Pairs Analysis", 
+                        value="pairs",
+                        style={'backgroundColor': colors['secondary'], 'color': colors['text']},
+                        selected_style={'backgroundColor': colors['accent'], 'color': 'black'}
+                    )
+                ],
+                style={'height': '50px'}
+            ),
+            html.Div(id="tab-content", style={'marginTop': '20px'})
+        ])
     ])
     
-], fluid=True, style={'backgroundColor': colors['background'], 'minHeight': '100vh', 'padding': '20px'})
+], fluid=True, style=custom_style)
+
+# Tab content callback
+@callback(
+    Output("tab-content", "children"),
+    [Input("main-tabs", "value")]
+)
+def render_tab_content(active_tab):
+    if active_tab == "clusters":
+        return html.Div([
+            dbc.Row([
+                dbc.Col([
+                    html.Div([
+                        html.H4("🎯 Cluster Information", style={'color': colors['text']}),
+                        html.Div(id="cluster-info")
+                    ], style=card_style)
+                ], width=12)
+            ]),
+            dbc.Row([
+                dbc.Col([
+                    html.Div([
+                        html.H4("🗺️ Cluster Visualization (PCA)", style={'color': colors['text']}),
+                        dcc.Graph(id="cluster-plot", style={'height': '500px'})
+                    ], style=card_style)
+                ], width=12)
+            ])
+        ])
+    
+    elif active_tab == "pairs":
+        return html.Div([
+            dbc.Row([
+                dbc.Col([
+                    html.Div([
+                        html.H4("📋 Select Trading Pair", style={'color': colors['text']}),
+                        dcc.Dropdown(
+                            id='pair-dropdown',
+                            placeholder="Choose a cointegrated pair...",
+                            style={'backgroundColor': colors['secondary'], 'color': 'black'}
+                        )
+                    ], style=card_style)
+                ], width=12)
+            ]),
+            dbc.Row([
+                dbc.Col([
+                    html.Div([
+                        html.H4("📈 Pair Statistics", style={'color': colors['text']}),
+                        html.Div(id="pair-stats")
+                    ], style=card_style)
+                ], width=4),
+                dbc.Col([
+                    html.Div([
+                        html.H4("🎯 Price Relationship", style={'color': colors['text']}),
+                        dcc.Graph(id="2d-plot", style={'height': '400px'})
+                    ], style=card_style)
+                ], width=8)
+            ]),
+            dbc.Row([
+                dbc.Col([
+                    html.Div([
+                        html.H4("📊 Spread Analysis", style={'color': colors['text']}),
+                        dcc.Graph(id="spread-plot", style={'height': '400px'})
+                    ], style=card_style)
+                ], width=12)
+            ])
+        ])
 
 # Callbacks
 @callback(
@@ -482,47 +639,90 @@ def update_analysis(n_clicks, start_date, end_date, alpha, triplets_enabled):
         assets = pair[0]
         p_val = pair[1]
         if len(assets) == 2:
-            label = f"{assets[0]} - {assets[1]} (p={p_val:.4f})"
+            label = f"🔗 {assets[0]} ↔ {assets[1]} (p={p_val:.4f})"
             value = f"{assets[0]}|{assets[1]}"
         else:  # Triplets
-            label = f"{' - '.join(assets)} (p={p_val:.4f})"
+            label = f"🔺 {' ↔ '.join(assets)} (p={p_val:.4f})"
             value = "|".join(assets)
         pair_options.append({'label': label, 'value': value})
     
     selected_pair = pair_options[0]['value'] if pair_options else None
     
-    # Cluster information
+    # Cluster information with enhanced styling
     clusters = cluster_info.get('clusters', {})
     cluster_info_div = []
     
-    for cluster_id, stocks in clusters.items():
-        if cluster_id != -1:  # Exclude noise points
-            cluster_info_div.append(
-                html.Div([
-                    html.H5(f"Cluster {cluster_id}: {len(stocks)} stocks", 
-                           style={'color': colors['accent']}),
-                    html.P(", ".join(stocks), style={'color': colors['text']})
-                ], style={'marginBottom': 15})
-            )
+    total_pairs = len([pair for pair in pairs_with_pvals if len(pair[0]) == 2])
+    total_triplets = len([pair for pair in pairs_with_pvals if len(pair[0]) == 3])
     
-    # Cluster visualization using PCA
-    cluster_fig = go.Figure()
+    # Summary card
+    cluster_info_div.append(
+        html.Div([
+            html.H5("📊 Analysis Summary", style={'color': colors['success'], 'marginBottom': '15px'}),
+            dbc.Row([
+                dbc.Col([
+                    html.Div([
+                        html.H3(f"{len([c for c in clusters.keys() if c != -1])}", style={'color': colors['accent'], 'margin': 0}),
+                        html.P("Valid Clusters", style={'color': colors['text'], 'margin': 0})
+                    ], style={'textAlign': 'center'})
+                ], width=3),
+                dbc.Col([
+                    html.Div([
+                        html.H3(f"{total_pairs}", style={'color': colors['success'], 'margin': 0}),
+                        html.P("Cointegrated Pairs", style={'color': colors['text'], 'margin': 0})
+                    ], style={'textAlign': 'center'})
+                ], width=3),
+                dbc.Col([
+                    html.Div([
+                        html.H3(f"{total_triplets}", style={'color': colors['info'], 'margin': 0}),
+                        html.P("Cointegrated Triplets", style={'color': colors['text'], 'margin': 0})
+                    ], style={'textAlign': 'center'})
+                ], width=3),
+                dbc.Col([
+                    html.Div([
+                        html.H3(f"{len(clusters.get(-1, []))}", style={'color': colors['warning'], 'margin': 0}),
+                        html.P("Noise Points", style={'color': colors['text'], 'margin': 0})
+                    ], style={'textAlign': 'center'})
+                ], width=3)
+            ])
+        ], style={'backgroundColor': 'rgba(0,255,127,0.1)', 'padding': '20px', 'borderRadius': '10px', 'marginBottom': '20px'})
+    )
+    
+    # Individual cluster cards
+    for cluster_id in sorted([c for c in clusters.keys() if c != -1]):
+        stocks = clusters[cluster_id]
+        cluster_info_div.append(
+            html.Div([
+                html.H6(f"🎯 Cluster {cluster_id}", style={'color': colors['accent'], 'marginBottom': '10px'}),
+                html.P(f"📊 {len(stocks)} stocks", style={'color': colors['text'], 'marginBottom': '5px'}),
+                html.P(f"📈 {', '.join(stocks)}", style={'color': colors['info'], 'fontSize': '0.9rem'})
+            ], style={
+                'backgroundColor': 'rgba(255,165,0,0.1)', 
+                'padding': '15px', 
+                'borderRadius': '8px', 
+                'marginBottom': '10px',
+                'border': f'1px solid {colors["accent"]}'
+            })
+        )
+    
+    # Cluster visualization using PCA with enhanced styling
+    cluster_fig = create_styled_figure()
     
     if cluster_info.get('vector_data'):
         # Apply PCA for 2D visualization
         pca = PCA(n_components=2)
         vector_2d = pca.fit_transform(cluster_info['vector_data'])
         
-        # Color by cluster
+        # Color by cluster with enhanced palette
         unique_clusters = set(cluster_info['cluster_assignments'])
-        colors_list = px.colors.qualitative.Set1
+        colors_list = px.colors.qualitative.Set3
         
         for i, cluster_id in enumerate(unique_clusters):
             mask = [c == cluster_id for c in cluster_info['cluster_assignments']]
             cluster_data = vector_2d[np.array(mask)]
             cluster_labels = [cluster_info['labels'][j] for j, m in enumerate(mask) if m]
             
-            color = colors_list[i % len(colors_list)] if cluster_id != -1 else 'grey'
+            color = colors_list[i % len(colors_list)] if cluster_id != -1 else '#666666'
             name = f"Cluster {cluster_id}" if cluster_id != -1 else "Noise"
             
             cluster_fig.add_trace(go.Scatter(
@@ -531,18 +731,26 @@ def update_analysis(n_clicks, start_date, end_date, alpha, triplets_enabled):
                 mode='markers+text',
                 text=cluster_labels,
                 textposition='top center',
-                marker=dict(color=color, size=10),
-                name=name
+                textfont=dict(size=8, color='white'),
+                marker=dict(
+                    color=color, 
+                    size=12,
+                    line=dict(width=1, color='white'),
+                    opacity=0.8
+                ),
+                name=name,
+                hovertemplate='<b>%{text}</b><br>PC1: %{x:.2f}<br>PC2: %{y:.2f}<extra></extra>'
             ))
     
     cluster_fig.update_layout(
-        title="Stock Clusters (PCA Visualization)",
+        title=dict(
+            text="Stock Clusters in Latent Space (PCA Projection)",
+            x=0.5,
+            font=dict(size=18, color=colors['text'])
+        ),
         xaxis_title="First Principal Component",
         yaxis_title="Second Principal Component",
-        paper_bgcolor=colors['background'],
-        plot_bgcolor=colors['secondary'],
-        font=dict(color=colors['text']),
-        title_font_color=colors['text']
+        height=500
     )
     
     return pair_options, selected_pair, cluster_info_div, cluster_fig
@@ -556,14 +764,10 @@ def update_analysis(n_clicks, start_date, end_date, alpha, triplets_enabled):
      dash.State('end-date', 'date')]
 )
 def update_pair_analysis(selected_pair, start_date, end_date):
+    empty_fig = create_styled_figure()
+    
     if not selected_pair:
-        empty_fig = go.Figure()
-        empty_fig.update_layout(
-            paper_bgcolor=colors['background'],
-            plot_bgcolor=colors['secondary'],
-            font=dict(color=colors['text'])
-        )
-        return html.P("No pair selected", style={'color': colors['text']}), empty_fig, empty_fig
+        return html.P("🔍 Select a pair to analyze", style={'color': colors['text'], 'textAlign': 'center'}), empty_fig, empty_fig
     
     # Parse selected assets (can be pair or triplet)
     assets = selected_pair.split('|')
@@ -572,13 +776,7 @@ def update_pair_analysis(selected_pair, start_date, end_date):
     pair_data = get_pair_data(assets, start_date, end_date)
     
     if len(pair_data) < 2:
-        empty_fig = go.Figure()
-        empty_fig.update_layout(
-            paper_bgcolor=colors['background'],
-            plot_bgcolor=colors['secondary'],
-            font=dict(color=colors['text'])
-        )
-        return html.P("Error loading asset data", style={'color': colors['warning']}), empty_fig, empty_fig
+        return html.P("❌ Error loading asset data", style={'color': colors['warning']}), empty_fig, empty_fig
     
     # For display purposes, use first two assets for spread analysis
     main_assets = assets[:2]
@@ -588,19 +786,12 @@ def update_pair_analysis(selected_pair, start_date, end_date):
     stats = calculate_spread_and_stats(main_pair_data)
     
     if not stats:
-        empty_fig = go.Figure()
-        empty_fig.update_layout(
-            paper_bgcolor=colors['background'],
-            plot_bgcolor=colors['secondary'],
-            font=dict(color=colors['text'])
-        )
-        return html.P("Error calculating statistics", style={'color': colors['warning']}), empty_fig, empty_fig
+        return html.P("❌ Error calculating statistics", style={'color': colors['warning']}), empty_fig, empty_fig
     
     # Recalculate p-value for all selected assets
     try:
         p_val = multi_cointegration_test(pair_data)['p_value']
         if len(assets) > 2:
-            # For triplets, show additional info
             test_type = "Johansen (multivariate)"
         else:
             test_type = "Phillips-Ouliaris (pairwise)"
@@ -608,37 +799,49 @@ def update_pair_analysis(selected_pair, start_date, end_date):
         p_val = "N/A"
         test_type = "Error"
     
-    # Asset statistics
+    # Enhanced statistics display
     stock1, stock2 = main_assets
     stats_div = [
-        html.H5(f"{' - '.join(assets)}" + (" (Triplet)" if len(assets) > 2 else ""), 
-               style={'color': colors['accent']}),
-        html.P(f"Test Type: {test_type}", style={'color': colors['text']}),
-        html.P(f"P-value: {p_val:.6f}" if isinstance(p_val, float) else f"P-value: {p_val}", 
-               style={'color': colors['text']}),
+        html.Div([
+            html.H5(f"📊 {' ↔ '.join(assets)}", style={'color': colors['accent'], 'marginBottom': '15px'}),
+            html.Div([
+                html.P([html.Strong("Test Type: "), test_type], style={'color': colors['text'], 'marginBottom': '8px'}),
+                html.P([
+                    html.Strong("P-value: "), 
+                    html.Span(f"{p_val:.6f}" if isinstance(p_val, float) else f"{p_val}", 
+                             style={'color': colors['success'] if isinstance(p_val, float) and p_val < 0.05 else colors['warning']})
+                ], style={'marginBottom': '8px'}),
+                html.P([html.Strong("Correlation: "), f"{stats['correlation']:.4f}"], style={'color': colors['text'], 'marginBottom': '8px'}),
+                html.P([html.Strong("Beta (spread): "), f"{stats['beta_spread']:.4f}"], style={'color': colors['text'], 'marginBottom': '8px'}),
+                html.P([html.Strong("Full period β: "), f"{stats['lr_full'].coef_[0]:.4f}"], style={'color': colors['text'], 'marginBottom': '8px'}),
+                html.P([html.Strong("R²: "), f"{stats['lr_full'].score(stats['aligned_data'][stock2].values.reshape(-1, 1), stats['aligned_data'][stock1].values):.4f}"], style={'color': colors['text']})
+            ])
+        ])
     ]
     
     if len(assets) > 2:
-        stats_div.append(html.P(f"Showing spread analysis for: {stock1} - {stock2}", 
-                               style={'color': colors['accent'], 'fontStyle': 'italic'}))
+        stats_div.append(
+            html.Div([
+                html.P(f"📈 Spread analysis: {stock1} - {stock2}", 
+                      style={'color': colors['info'], 'fontStyle': 'italic', 'marginTop': '15px'})
+            ])
+        )
     
-    stats_div.extend([
-        html.P(f"Correlation ({stock1}-{stock2}): {stats['correlation']:.4f}", style={'color': colors['text']}),
-        html.P(f"Beta (for spread): {stats['beta_spread']:.4f}", style={'color': colors['text']}),
-        html.P(f"Full period beta: {stats['lr_full'].coef_[0]:.4f}", style={'color': colors['text']}),
-        html.P(f"Full period R²: {stats['lr_full'].score(stats['aligned_data'][stock2].values.reshape(-1, 1), stats['aligned_data'][stock1].values):.4f}", 
-               style={'color': colors['text']})
-    ])
-    
-    # 2D scatter plot
-    scatter_fig = go.Figure()
+    # Enhanced 2D scatter plot
+    scatter_fig = create_styled_figure()
     
     scatter_fig.add_trace(go.Scatter(
         x=stats['aligned_data'][stock2],
         y=stats['aligned_data'][stock1],
         mode='markers',
-        marker=dict(color=colors['accent'], size=4),
-        name='Data Points'
+        marker=dict(
+            color=colors['accent'], 
+            size=6,
+            opacity=0.7,
+            line=dict(width=0.5, color='white')
+        ),
+        name='Price Points',
+        hovertemplate=f'<b>{stock2}</b>: $%{{x:.2f}}<br><b>{stock1}</b>: $%{{y:.2f}}<extra></extra>'
     ))
     
     # Add regression line
@@ -649,57 +852,89 @@ def update_pair_analysis(selected_pair, start_date, end_date):
         x=x_range,
         y=y_pred,
         mode='lines',
-        line=dict(color=colors['success'], width=2),
-        name='Regression Line'
+        line=dict(color=colors['success'], width=3),
+        name='Regression Line',
+        hovertemplate='<b>Regression</b><br>%{x:.2f} → %{y:.2f}<extra></extra>'
     ))
     
     scatter_fig.update_layout(
-        title=f"{stock1} vs {stock2}",
-        xaxis_title=stock2,
-        yaxis_title=stock1,
-        paper_bgcolor=colors['background'],
-        plot_bgcolor=colors['secondary'],
-        font=dict(color=colors['text']),
-        title_font_color=colors['text']
+        title=dict(
+            text=f"{stock1} vs {stock2} • R² = {stats['lr_full'].score(stats['aligned_data'][stock2].values.reshape(-1, 1), stats['aligned_data'][stock1].values):.3f}",
+            x=0.5
+        ),
+        xaxis_title=f"{stock2} Price ($)",
+        yaxis_title=f"{stock1} Price ($)",
+        height=400
     )
     
-    # Spread plot
-    spread_fig = go.Figure()
+    # Enhanced spread plot
+    spread_fig = create_styled_figure()
     
     spread_fig.add_trace(go.Scatter(
         x=stats['spread'].index,
         y=stats['spread'],
         mode='lines',
-        line=dict(color=colors['text']),
-        name='Spread'
+        line=dict(color=colors['text'], width=2),
+        name='Spread',
+        hovertemplate='<b>%{x}</b><br>Spread: %{y:.2f}<extra></extra>'
     ))
     
-    # Add mean line
+    # Add statistical bands
     spread_mean = stats['spread'].mean()
-    spread_fig.add_hline(y=spread_mean, line_dash="dash", 
-                        line_color=colors['accent'], 
-                        annotation_text=f"Mean: {spread_mean:.2f}")
-    
-    # Add +/- 2 standard deviation lines
     spread_std = stats['spread'].std()
-    spread_fig.add_hline(y=spread_mean + 2*spread_std, line_dash="dot", 
-                        line_color=colors['warning'], 
-                        annotation_text=f"+2σ: {spread_mean + 2*spread_std:.2f}")
-    spread_fig.add_hline(y=spread_mean - 2*spread_std, line_dash="dot", 
-                        line_color=colors['warning'], 
-                        annotation_text=f"-2σ: {spread_mean - 2*spread_std:.2f}")
+    
+    spread_fig.add_hline(
+        y=spread_mean, 
+        line_dash="dash", 
+        line_color=colors['accent'], 
+        annotation_text=f"Mean: {spread_mean:.2f}",
+        annotation_position="bottom right"
+    )
+    
+    spread_fig.add_hline(
+        y=spread_mean + 2*spread_std, 
+        line_dash="dot", 
+        line_color=colors['warning'], 
+        annotation_text=f"+2σ: {spread_mean + 2*spread_std:.2f}",
+        annotation_position="top right"
+    )
+    
+    spread_fig.add_hline(
+        y=spread_mean - 2*spread_std, 
+        line_dash="dot", 
+        line_color=colors['warning'], 
+        annotation_text=f"-2σ: {spread_mean - 2*spread_std:.2f}",
+        annotation_position="bottom right"
+    )
+    
+    # Add background shading for trading zones
+    spread_fig.add_hrect(
+        y0=spread_mean + 2*spread_std, 
+        y1=spread_mean + 3*spread_std, 
+        fillcolor="rgba(255,99,71,0.2)", 
+        layer="below", 
+        line_width=0
+    )
+    
+    spread_fig.add_hrect(
+        y0=spread_mean - 2*spread_std, 
+        y1=spread_mean - 3*spread_std, 
+        fillcolor="rgba(255,99,71,0.2)", 
+        layer="below", 
+        line_width=0
+    )
     
     spread_fig.update_layout(
-        title=f"Spread: {stock1} - {stats['beta_spread']:.4f} * {stock2}",
+        title=dict(
+            text=f"Spread: {stock1} - {stats['beta_spread']:.4f} × {stock2}",
+            x=0.5
+        ),
         xaxis_title="Date",
-        yaxis_title="Spread",
-        paper_bgcolor=colors['background'],
-        plot_bgcolor=colors['secondary'],
-        font=dict(color=colors['text']),
-        title_font_color=colors['text']
+        yaxis_title="Spread Value",
+        height=400
     )
     
     return stats_div, scatter_fig, spread_fig
 
 if __name__ == '__main__':
-    app.run_server(debug=True, host='0.0.0.0', port=8050) 
+    app.run(debug=True, host='0.0.0.0', port=8050) 
