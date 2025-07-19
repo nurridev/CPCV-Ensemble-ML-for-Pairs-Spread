@@ -429,38 +429,71 @@ def calculate_spread_and_stats(pair_data, split_ratio=0.2):
     aligned_data = pd.concat([stock1_data, stock2_data], axis=1).dropna()
     aligned_data.columns = stocks
     
+    # Check if we have sufficient data
     if len(aligned_data) == 0:
+        print(f"Warning: No overlapping data between {stocks[0]} and {stocks[1]}")
         return None
     
-    # Calculate beta using first 20% of data
-    split_point = int(len(aligned_data) * split_ratio)
-    train_data = aligned_data.iloc[:split_point]
+    if len(aligned_data) < 10:  # Need at least 10 data points
+        print(f"Warning: Insufficient data for {stocks[0]} and {stocks[1]}: only {len(aligned_data)} points")
+        return None
     
-    # Linear regression for beta calculation (spread)
-    X_train = train_data[stocks[1]].values.reshape(-1, 1)
-    y_train = train_data[stocks[0]].values
-    lr_spread = LinearRegression().fit(X_train, y_train)
-    beta_spread = lr_spread.coef_[0]
+    # Calculate split point with minimum requirements
+    min_train_size = max(2, int(len(aligned_data) * 0.05))  # At least 2 points or 5% of data
+    split_point = max(min_train_size, int(len(aligned_data) * split_ratio))
     
-    # Calculate spread for entire period
-    spread = aligned_data[stocks[0]] - beta_spread * aligned_data[stocks[1]]
+    # Ensure we don't exceed available data
+    split_point = min(split_point, len(aligned_data) - 1)
     
-    # Linear regression for entire dataset (for 2D plot)
-    X_full = aligned_data[stocks[1]].values.reshape(-1, 1)
-    y_full = aligned_data[stocks[0]].values
-    lr_full = LinearRegression().fit(X_full, y_full)
-    
-    # Calculate correlation and other stats
-    correlation = aligned_data[stocks[0]].corr(aligned_data[stocks[1]])
-    
-    return {
-        'aligned_data': aligned_data,
-        'spread': spread,
-        'beta_spread': beta_spread,
-        'lr_full': lr_full,
-        'correlation': correlation,
-        'stocks': stocks
-    }
+    try:
+        train_data = aligned_data.iloc[:split_point]
+        
+        if len(train_data) < 2:
+            print(f"Warning: Training data too small: {len(train_data)} points")
+            # Fall back to using more data for training
+            split_point = min(10, len(aligned_data) // 2)
+            train_data = aligned_data.iloc[:split_point]
+            
+        if len(train_data) < 2:
+            print(f"Error: Still insufficient training data: {len(train_data)} points")
+            return None
+        
+        # Linear regression for beta calculation (spread)
+        X_train = train_data[stocks[1]].values.reshape(-1, 1)
+        y_train = train_data[stocks[0]].values
+        
+        if len(X_train) == 0 or len(y_train) == 0:
+            print(f"Error: Empty training arrays - X: {len(X_train)}, y: {len(y_train)}")
+            return None
+            
+        lr_spread = LinearRegression().fit(X_train, y_train)
+        beta_spread = lr_spread.coef_[0]
+        
+        # Calculate spread for entire period
+        spread = aligned_data[stocks[0]] - beta_spread * aligned_data[stocks[1]]
+        
+        # Linear regression for entire dataset (for 2D plot)
+        X_full = aligned_data[stocks[1]].values.reshape(-1, 1)
+        y_full = aligned_data[stocks[0]].values
+        lr_full = LinearRegression().fit(X_full, y_full)
+        
+        # Calculate correlation and other stats
+        correlation = aligned_data[stocks[0]].corr(aligned_data[stocks[1]])
+        
+        return {
+            'aligned_data': aligned_data,
+            'spread': spread,
+            'beta_spread': beta_spread,
+            'lr_full': lr_full,
+            'correlation': correlation,
+            'stocks': stocks,
+            'data_points': len(aligned_data),
+            'train_points': len(train_data)
+        }
+        
+    except Exception as e:
+        print(f"Error in calculate_spread_and_stats for {stocks[0]}-{stocks[1]}: {str(e)}")
+        return None
 
 def create_styled_figure():
     """Create a standardized plotly figure with consistent styling"""
@@ -1004,220 +1037,261 @@ def update_pair_analysis(selected_pair, update_clicks, pairs_data, analysis_star
     # Parse selected assets (can be pair or triplet)
     assets = selected_pair.split('|')
     
-    # Get data for the analysis period
-    pair_data = get_pair_data(assets, start_date, end_date)
-    
-    if len(pair_data) < 2:
-        return html.P("❌ Error loading asset data for analysis period", style={'color': colors['warning']}), empty_fig, empty_fig, period_text
-    
-    # For display purposes, use first two assets for spread analysis
-    main_assets = assets[:2]
-    main_pair_data = {asset: pair_data[asset] for asset in main_assets if asset in pair_data}
-    
-    # Calculate spread and statistics for main pair
-    stats = calculate_spread_and_stats(main_pair_data)
-    
-    if not stats:
-        return html.P("❌ Error calculating statistics for analysis period", style={'color': colors['warning']}), empty_fig, empty_fig, period_text
-    
-    # Recalculate p-value for the analysis period
     try:
-        cointegration_result = multi_cointegration_test(pair_data)
-        p_val = cointegration_result['p_value']
-        if len(assets) > 2:
-            test_type = "Johansen (multivariate)"
-        else:
-            test_type = "Phillips-Ouliaris (pairwise)"
-            
-        # Additional statistics from cointegration test
-        if 'critical_values' in cointegration_result:
-            crit_vals = cointegration_result['critical_values']
-            is_significant_1pct = p_val < 0.01
-            is_significant_5pct = p_val < 0.05
-            is_significant_10pct = p_val < 0.10
-        else:
+        # Get data for the analysis period
+        pair_data = get_pair_data(assets, start_date, end_date)
+        
+        if len(pair_data) < 2:
+            error_msg = html.Div([
+                html.P("❌ Error loading asset data for analysis period", style={'color': colors['warning']}),
+                html.P(f"Available assets: {list(pair_data.keys())}", style={'color': colors['text'], 'fontSize': '0.9rem'})
+            ])
+            return error_msg, empty_fig, empty_fig, period_text
+        
+        # Check data quality
+        data_lengths = {asset: len(data) for asset, data in pair_data.items()}
+        min_length = min(data_lengths.values())
+        
+        if min_length == 0:
+            error_msg = html.Div([
+                html.P("❌ No data available for the selected analysis period", style={'color': colors['warning']}),
+                html.P(f"Data lengths: {data_lengths}", style={'color': colors['text'], 'fontSize': '0.9rem'}),
+                html.P("Try selecting a different date range", style={'color': colors['accent'], 'fontSize': '0.9rem'})
+            ])
+            return error_msg, empty_fig, empty_fig, period_text
+        
+        # For display purposes, use first two assets for spread analysis
+        main_assets = assets[:2]
+        main_pair_data = {asset: pair_data[asset] for asset in main_assets if asset in pair_data}
+        
+        # Calculate spread and statistics for main pair
+        stats = calculate_spread_and_stats(main_pair_data)
+        
+        if not stats:
+            error_msg = html.Div([
+                html.P("❌ Insufficient data for statistical analysis", style={'color': colors['warning']}),
+                html.P(f"Period: {start_date} to {end_date}", style={'color': colors['text'], 'fontSize': '0.9rem'}),
+                html.P(f"Available data points: {min_length}", style={'color': colors['text'], 'fontSize': '0.9rem'}),
+                html.P("Try a longer date range (need at least 10 overlapping data points)", style={'color': colors['accent'], 'fontSize': '0.9rem'})
+            ])
+            return error_msg, empty_fig, empty_fig, period_text
+        
+        # Recalculate p-value for the analysis period
+        try:
+            cointegration_result = multi_cointegration_test(pair_data)
+            p_val = cointegration_result['p_value']
+            if len(assets) > 2:
+                test_type = "Johansen (multivariate)"
+            else:
+                test_type = "Phillips-Ouliaris (pairwise)"
+                
+            # Additional statistics from cointegration test
+            if 'critical_values' in cointegration_result:
+                crit_vals = cointegration_result['critical_values']
+                is_significant_1pct = p_val < 0.01
+                is_significant_5pct = p_val < 0.05
+                is_significant_10pct = p_val < 0.10
+            else:
+                crit_vals = None
+                is_significant_1pct = is_significant_5pct = is_significant_10pct = False
+                
+        except Exception as e:
+            print(f"Error in cointegration test: {e}")
+            p_val = "N/A"
+            test_type = "Error"
             crit_vals = None
             is_significant_1pct = is_significant_5pct = is_significant_10pct = False
-            
-    except Exception as e:
-        p_val = "N/A"
-        test_type = "Error"
-        crit_vals = None
-        is_significant_1pct = is_significant_5pct = is_significant_10pct = False
-        print(f"Error in cointegration test: {e}")
-    
-    # Enhanced statistics display
-    stock1, stock2 = main_assets
-    r_squared = stats['lr_full'].score(stats['aligned_data'][stock2].values.reshape(-1, 1), stats['aligned_data'][stock1].values)
-    
-    stats_div = [
-        html.Div([
-            html.H5(f"📊 {' ↔ '.join(assets)}", style={'color': colors['accent'], 'marginBottom': '15px'}),
-            
-            # Cointegration Test Results
+        
+        # Enhanced statistics display
+        stock1, stock2 = main_assets
+        r_squared = stats['lr_full'].score(stats['aligned_data'][stock2].values.reshape(-1, 1), stats['aligned_data'][stock1].values)
+        
+        stats_div = [
             html.Div([
-                html.H6("🧪 Cointegration Test", style={'color': colors['info'], 'marginBottom': '10px'}),
-                html.P([html.Strong("Test Type: "), test_type], style={'color': colors['text'], 'marginBottom': '5px'}),
-                html.P([
-                    html.Strong("P-value: "), 
-                    html.Span(f"{p_val:.6f}" if isinstance(p_val, float) else f"{p_val}", 
-                             style={'color': colors['success'] if isinstance(p_val, float) and p_val < 0.05 else colors['warning']})
-                ], style={'marginBottom': '5px'}),
+                html.H5(f"📊 {' ↔ '.join(assets)}", style={'color': colors['accent'], 'marginBottom': '15px'}),
                 
-                # Significance levels
+                # Data Quality Information
                 html.Div([
+                    html.H6("📋 Data Quality", style={'color': colors['info'], 'marginBottom': '10px'}),
+                    html.P([html.Strong("Data Points: "), f"{stats['data_points']} (Training: {stats['train_points']})"], style={'color': colors['text'], 'marginBottom': '5px'}),
+                    html.P([html.Strong("Period: "), f"{start_date} to {end_date}"], style={'color': colors['text'], 'marginBottom': '5px'})
+                ], style={'marginBottom': '15px', 'padding': '10px', 'backgroundColor': 'rgba(128,128,128,0.1)', 'borderRadius': '5px'}),
+                
+                # Cointegration Test Results
+                html.Div([
+                    html.H6("🧪 Cointegration Test", style={'color': colors['info'], 'marginBottom': '10px'}),
+                    html.P([html.Strong("Test Type: "), test_type], style={'color': colors['text'], 'marginBottom': '5px'}),
                     html.P([
-                        html.Span("✅" if is_significant_1pct else "❌", style={'marginRight': '5px'}),
-                        "Significant at 1% level"
-                    ], style={'color': colors['success'] if is_significant_1pct else colors['text'], 'marginBottom': '3px', 'fontSize': '0.9rem'}),
-                    html.P([
-                        html.Span("✅" if is_significant_5pct else "❌", style={'marginRight': '5px'}),
-                        "Significant at 5% level"
-                    ], style={'color': colors['success'] if is_significant_5pct else colors['text'], 'marginBottom': '3px', 'fontSize': '0.9rem'}),
-                    html.P([
-                        html.Span("✅" if is_significant_10pct else "❌", style={'marginRight': '5px'}),
-                        "Significant at 10% level"
-                    ], style={'color': colors['success'] if is_significant_10pct else colors['text'], 'marginBottom': '10px', 'fontSize': '0.9rem'})
-                ])
-            ], style={'marginBottom': '15px', 'padding': '10px', 'backgroundColor': 'rgba(64,224,208,0.1)', 'borderRadius': '5px'}),
-            
-            # Regression Statistics
-            html.Div([
-                html.H6("📈 Regression Statistics", style={'color': colors['info'], 'marginBottom': '10px'}),
-                html.P([html.Strong("Correlation: "), f"{stats['correlation']:.4f}"], style={'color': colors['text'], 'marginBottom': '5px'}),
-                html.P([html.Strong("R²: "), f"{r_squared:.4f}"], style={'color': colors['text'], 'marginBottom': '5px'}),
-                html.P([html.Strong("Beta (spread): "), f"{stats['beta_spread']:.4f}"], style={'color': colors['text'], 'marginBottom': '5px'}),
-                html.P([html.Strong("Full period β: "), f"{stats['lr_full'].coef_[0]:.4f}"], style={'color': colors['text']})
-            ], style={'marginBottom': '15px', 'padding': '10px', 'backgroundColor': 'rgba(255,165,0,0.1)', 'borderRadius': '5px'}),
-            
-            # Spread Statistics
-            html.Div([
-                html.H6("📊 Spread Statistics", style={'color': colors['info'], 'marginBottom': '10px'}),
-                html.P([html.Strong("Mean: "), f"{stats['spread'].mean():.4f}"], style={'color': colors['text'], 'marginBottom': '5px'}),
-                html.P([html.Strong("Std Dev: "), f"{stats['spread'].std():.4f}"], style={'color': colors['text'], 'marginBottom': '5px'}),
-                html.P([html.Strong("Min: "), f"{stats['spread'].min():.4f}"], style={'color': colors['text'], 'marginBottom': '5px'}),
-                html.P([html.Strong("Max: "), f"{stats['spread'].max():.4f}"], style={'color': colors['text']})
-            ], style={'padding': '10px', 'backgroundColor': 'rgba(0,255,127,0.1)', 'borderRadius': '5px'})
-        ])
-    ]
-    
-    if len(assets) > 2:
-        stats_div.append(
-            html.Div([
-                html.P(f"📈 Spread analysis: {stock1} - {stock2}", 
-                      style={'color': colors['info'], 'fontStyle': 'italic', 'marginTop': '15px'})
+                        html.Strong("P-value: "), 
+                        html.Span(f"{p_val:.6f}" if isinstance(p_val, float) else f"{p_val}", 
+                                 style={'color': colors['success'] if isinstance(p_val, float) and p_val < 0.05 else colors['warning']})
+                    ], style={'marginBottom': '5px'}),
+                    
+                    # Significance levels
+                    html.Div([
+                        html.P([
+                            html.Span("✅" if is_significant_1pct else "❌", style={'marginRight': '5px'}),
+                            "Significant at 1% level"
+                        ], style={'color': colors['success'] if is_significant_1pct else colors['text'], 'marginBottom': '3px', 'fontSize': '0.9rem'}),
+                        html.P([
+                            html.Span("✅" if is_significant_5pct else "❌", style={'marginRight': '5px'}),
+                            "Significant at 5% level"
+                        ], style={'color': colors['success'] if is_significant_5pct else colors['text'], 'marginBottom': '3px', 'fontSize': '0.9rem'}),
+                        html.P([
+                            html.Span("✅" if is_significant_10pct else "❌", style={'marginRight': '5px'}),
+                            "Significant at 10% level"
+                        ], style={'color': colors['success'] if is_significant_10pct else colors['text'], 'marginBottom': '10px', 'fontSize': '0.9rem'})
+                    ])
+                ], style={'marginBottom': '15px', 'padding': '10px', 'backgroundColor': 'rgba(64,224,208,0.1)', 'borderRadius': '5px'}),
+                
+                # Regression Statistics
+                html.Div([
+                    html.H6("📈 Regression Statistics", style={'color': colors['info'], 'marginBottom': '10px'}),
+                    html.P([html.Strong("Correlation: "), f"{stats['correlation']:.4f}"], style={'color': colors['text'], 'marginBottom': '5px'}),
+                    html.P([html.Strong("R²: "), f"{r_squared:.4f}"], style={'color': colors['text'], 'marginBottom': '5px'}),
+                    html.P([html.Strong("Beta (spread): "), f"{stats['beta_spread']:.4f}"], style={'color': colors['text'], 'marginBottom': '5px'}),
+                    html.P([html.Strong("Full period β: "), f"{stats['lr_full'].coef_[0]:.4f}"], style={'color': colors['text']})
+                ], style={'marginBottom': '15px', 'padding': '10px', 'backgroundColor': 'rgba(255,165,0,0.1)', 'borderRadius': '5px'}),
+                
+                # Spread Statistics
+                html.Div([
+                    html.H6("📊 Spread Statistics", style={'color': colors['info'], 'marginBottom': '10px'}),
+                    html.P([html.Strong("Mean: "), f"{stats['spread'].mean():.4f}"], style={'color': colors['text'], 'marginBottom': '5px'}),
+                    html.P([html.Strong("Std Dev: "), f"{stats['spread'].std():.4f}"], style={'color': colors['text'], 'marginBottom': '5px'}),
+                    html.P([html.Strong("Min: "), f"{stats['spread'].min():.4f}"], style={'color': colors['text'], 'marginBottom': '5px'}),
+                    html.P([html.Strong("Max: "), f"{stats['spread'].max():.4f}"], style={'color': colors['text']})
+                ], style={'padding': '10px', 'backgroundColor': 'rgba(0,255,127,0.1)', 'borderRadius': '5px'})
             ])
+        ]
+        
+        if len(assets) > 2:
+            stats_div.append(
+                html.Div([
+                    html.P(f"📈 Spread analysis: {stock1} - {stock2}", 
+                          style={'color': colors['info'], 'fontStyle': 'italic', 'marginTop': '15px'})
+                ])
+            )
+        
+        # Enhanced 2D scatter plot
+        scatter_fig = create_styled_figure()
+        
+        scatter_fig.add_trace(go.Scatter(
+            x=stats['aligned_data'][stock2],
+            y=stats['aligned_data'][stock1],
+            mode='markers',
+            marker=dict(
+                color=colors['accent'], 
+                size=6,
+                opacity=0.7,
+                line=dict(width=0.5, color='white')
+            ),
+            name='Price Points',
+            hovertemplate=f'<b>{stock2}</b>: $%{{x:.2f}}<br><b>{stock1}</b>: $%{{y:.2f}}<extra></extra>'
+        ))
+        
+        # Add regression line
+        x_range = np.linspace(stats['aligned_data'][stock2].min(), stats['aligned_data'][stock2].max(), 100)
+        y_pred = stats['lr_full'].predict(x_range.reshape(-1, 1))
+        
+        scatter_fig.add_trace(go.Scatter(
+            x=x_range,
+            y=y_pred,
+            mode='lines',
+            line=dict(color=colors['success'], width=3),
+            name='Regression Line',
+            hovertemplate='<b>Regression</b><br>%{x:.2f} → %{y:.2f}<extra></extra>'
+        ))
+        
+        scatter_fig.update_layout(
+            title=dict(
+                text=f"{stock1} vs {stock2} • R² = {r_squared:.3f} • p = {p_val:.4f}" if isinstance(p_val, float) else f"{stock1} vs {stock2} • R² = {r_squared:.3f}",
+                x=0.5
+            ),
+            xaxis_title=f"{stock2} Price ($)",
+            yaxis_title=f"{stock1} Price ($)",
+            height=400
         )
-    
-    # Enhanced 2D scatter plot
-    scatter_fig = create_styled_figure()
-    
-    scatter_fig.add_trace(go.Scatter(
-        x=stats['aligned_data'][stock2],
-        y=stats['aligned_data'][stock1],
-        mode='markers',
-        marker=dict(
-            color=colors['accent'], 
-            size=6,
-            opacity=0.7,
-            line=dict(width=0.5, color='white')
-        ),
-        name='Price Points',
-        hovertemplate=f'<b>{stock2}</b>: $%{{x:.2f}}<br><b>{stock1}</b>: $%{{y:.2f}}<extra></extra>'
-    ))
-    
-    # Add regression line
-    x_range = np.linspace(stats['aligned_data'][stock2].min(), stats['aligned_data'][stock2].max(), 100)
-    y_pred = stats['lr_full'].predict(x_range.reshape(-1, 1))
-    
-    scatter_fig.add_trace(go.Scatter(
-        x=x_range,
-        y=y_pred,
-        mode='lines',
-        line=dict(color=colors['success'], width=3),
-        name='Regression Line',
-        hovertemplate='<b>Regression</b><br>%{x:.2f} → %{y:.2f}<extra></extra>'
-    ))
-    
-    scatter_fig.update_layout(
-        title=dict(
-            text=f"{stock1} vs {stock2} • R² = {r_squared:.3f} • p = {p_val:.4f}" if isinstance(p_val, float) else f"{stock1} vs {stock2} • R² = {r_squared:.3f}",
-            x=0.5
-        ),
-        xaxis_title=f"{stock2} Price ($)",
-        yaxis_title=f"{stock1} Price ($)",
-        height=400
-    )
-    
-    # Enhanced spread plot
-    spread_fig = create_styled_figure()
-    
-    spread_fig.add_trace(go.Scatter(
-        x=stats['spread'].index,
-        y=stats['spread'],
-        mode='lines',
-        line=dict(color=colors['text'], width=2),
-        name='Spread',
-        hovertemplate='<b>%{x}</b><br>Spread: %{y:.2f}<extra></extra>'
-    ))
-    
-    # Add statistical bands
-    spread_mean = stats['spread'].mean()
-    spread_std = stats['spread'].std()
-    
-    spread_fig.add_hline(
-        y=spread_mean, 
-        line_dash="dash", 
-        line_color=colors['accent'], 
-        annotation_text=f"Mean: {spread_mean:.2f}",
-        annotation_position="bottom right"
-    )
-    
-    spread_fig.add_hline(
-        y=spread_mean + 2*spread_std, 
-        line_dash="dot", 
-        line_color=colors['warning'], 
-        annotation_text=f"+2σ: {spread_mean + 2*spread_std:.2f}",
-        annotation_position="top right"
-    )
-    
-    spread_fig.add_hline(
-        y=spread_mean - 2*spread_std, 
-        line_dash="dot", 
-        line_color=colors['warning'], 
-        annotation_text=f"-2σ: {spread_mean - 2*spread_std:.2f}",
-        annotation_position="bottom right"
-    )
-    
-    # Add background shading for trading zones
-    spread_fig.add_hrect(
-        y0=spread_mean + 2*spread_std, 
-        y1=spread_mean + 3*spread_std, 
-        fillcolor="rgba(255,99,71,0.2)", 
-        layer="below", 
-        line_width=0
-    )
-    
-    spread_fig.add_hrect(
-        y0=spread_mean - 2*spread_std, 
-        y1=spread_mean - 3*spread_std, 
-        fillcolor="rgba(255,99,71,0.2)", 
-        layer="below", 
-        line_width=0
-    )
-    
-    # Add period information to spread plot title
-    spread_fig.update_layout(
-        title=dict(
-            text=f"Spread: {stock1} - {stats['beta_spread']:.4f} × {stock2} | Period: {start_date} to {end_date}",
-            x=0.5
-        ),
-        xaxis_title="Date",
-        yaxis_title="Spread Value",
-        height=400
-    )
-    
-    return stats_div, scatter_fig, spread_fig, period_text
+        
+        # Enhanced spread plot
+        spread_fig = create_styled_figure()
+        
+        spread_fig.add_trace(go.Scatter(
+            x=stats['spread'].index,
+            y=stats['spread'],
+            mode='lines',
+            line=dict(color=colors['text'], width=2),
+            name='Spread',
+            hovertemplate='<b>%{x}</b><br>Spread: %{y:.2f}<extra></extra>'
+        ))
+        
+        # Add statistical bands
+        spread_mean = stats['spread'].mean()
+        spread_std = stats['spread'].std()
+        
+        spread_fig.add_hline(
+            y=spread_mean, 
+            line_dash="dash", 
+            line_color=colors['accent'], 
+            annotation_text=f"Mean: {spread_mean:.2f}",
+            annotation_position="bottom right"
+        )
+        
+        spread_fig.add_hline(
+            y=spread_mean + 2*spread_std, 
+            line_dash="dot", 
+            line_color=colors['warning'], 
+            annotation_text=f"+2σ: {spread_mean + 2*spread_std:.2f}",
+            annotation_position="top right"
+        )
+        
+        spread_fig.add_hline(
+            y=spread_mean - 2*spread_std, 
+            line_dash="dot", 
+            line_color=colors['warning'], 
+            annotation_text=f"-2σ: {spread_mean - 2*spread_std:.2f}",
+            annotation_position="bottom right"
+        )
+        
+        # Add background shading for trading zones
+        spread_fig.add_hrect(
+            y0=spread_mean + 2*spread_std, 
+            y1=spread_mean + 3*spread_std, 
+            fillcolor="rgba(255,99,71,0.2)", 
+            layer="below", 
+            line_width=0
+        )
+        
+        spread_fig.add_hrect(
+            y0=spread_mean - 2*spread_std, 
+            y1=spread_mean - 3*spread_std, 
+            fillcolor="rgba(255,99,71,0.2)", 
+            layer="below", 
+            line_width=0
+        )
+        
+        # Add period information to spread plot title
+        spread_fig.update_layout(
+            title=dict(
+                text=f"Spread: {stock1} - {stats['beta_spread']:.4f} × {stock2} | {stats['data_points']} points | {start_date} to {end_date}",
+                x=0.5
+            ),
+            xaxis_title="Date",
+            yaxis_title="Spread Value",
+            height=400
+        )
+        
+        return stats_div, scatter_fig, spread_fig, period_text
+        
+    except Exception as e:
+        # Comprehensive error handling
+        error_msg = html.Div([
+            html.P("❌ Error in pair analysis", style={'color': colors['warning']}),
+            html.P(f"Error: {str(e)}", style={'color': colors['text'], 'fontSize': '0.9rem'}),
+            html.P(f"Period: {start_date} to {end_date}", style={'color': colors['text'], 'fontSize': '0.9rem'}),
+            html.P("Try selecting a different date range or pair", style={'color': colors['accent'], 'fontSize': '0.9rem'})
+        ])
+        print(f"Error in update_pair_analysis: {e}")
+        return error_msg, empty_fig, empty_fig, period_text
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=8050) 
