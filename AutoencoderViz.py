@@ -891,20 +891,66 @@ def render_tab_content(active_tab, pairs_data, analysis_complete):
             pair_options.append({'label': label, 'value': value})
         
         return html.Div([
+            # Pair Selection and Analysis Date Range
             dbc.Row([
                 dbc.Col([
                     html.Div([
-                        html.H4("📋 Select Trading Pair", style={'color': colors['text']}),
-                        dcc.Dropdown(
-                            id='pair-dropdown',
-                            options=pair_options,
-                            value=pair_options[0]['value'] if pair_options else None,
-                            placeholder="Choose a cointegrated pair...",
-                            style={'backgroundColor': colors['secondary'], 'color': 'black'}
-                        )
+                        html.H4("📋 Pair Selection & Analysis Period", style={'color': colors['text']}),
+                        dbc.Row([
+                            dbc.Col([
+                                html.Label("Select Trading Pair", style={'color': colors['text'], 'fontWeight': 'bold'}),
+                                dcc.Dropdown(
+                                    id='pair-dropdown',
+                                    options=pair_options,
+                                    value=pair_options[0]['value'] if pair_options else None,
+                                    placeholder="Choose a cointegrated pair...",
+                                    style={'backgroundColor': colors['secondary'], 'color': 'black'}
+                                )
+                            ], width=4),
+                            dbc.Col([
+                                html.Label("Analysis Start Date", style={'color': colors['text'], 'fontWeight': 'bold'}),
+                                dcc.DatePickerSingle(
+                                    id='analysis-start-date',
+                                    date=pairs_data['start_date'],
+                                    style={'width': '100%'}
+                                ),
+                                html.Small("Different from screening period", style={'color': colors['accent']})
+                            ], width=3),
+                            dbc.Col([
+                                html.Label("Analysis End Date", style={'color': colors['text'], 'fontWeight': 'bold'}),
+                                dcc.DatePickerSingle(
+                                    id='analysis-end-date',
+                                    date=pairs_data['end_date'],
+                                    style={'width': '100%'}
+                                ),
+                                html.Small("For detailed analysis", style={'color': colors['accent']})
+                            ], width=3),
+                            dbc.Col([
+                                dbc.Button("🔄 Update Analysis", id="update-pair-btn", color="info", size="sm",
+                                          style={'marginTop': '25px', 'width': '100%'})
+                            ], width=2)
+                        ]),
+                        html.Hr(style={'borderColor': colors['border'], 'margin': '20px 0'}),
+                        # Period Information
+                        dbc.Row([
+                            dbc.Col([
+                                html.Div([
+                                    html.P([
+                                        html.Strong("🔍 Screening Period: ", style={'color': colors['accent']}),
+                                        f"{pairs_data['start_date']} to {pairs_data['end_date']}"
+                                    ], style={'color': colors['text'], 'margin': 0}),
+                                    html.P([
+                                        html.Strong("📊 Analysis Period: ", style={'color': colors['info']}),
+                                        html.Span(id="current-analysis-period", children=f"{pairs_data['start_date']} to {pairs_data['end_date']}")
+                                    ], style={'color': colors['text'], 'margin': 0})
+                                ])
+                            ], width=12)
+                        ])
                     ], style=card_style)
                 ], width=12)
             ]),
+            
+            # Analysis Results
             dbc.Row([
                 dbc.Col([
                     html.Div([
@@ -929,30 +975,40 @@ def render_tab_content(active_tab, pairs_data, analysis_complete):
             ])
         ])
 
-# Simplified callback for pair analysis only
+# Enhanced callback for pair analysis with separate analysis dates
 @callback(
     [Output('pair-stats', 'children'),
      Output('2d-plot', 'figure'),
-     Output('spread-plot', 'figure')],
-    [Input('pair-dropdown', 'value')],
-    [dash.State('pairs-store', 'data')]
+     Output('spread-plot', 'figure'),
+     Output('current-analysis-period', 'children')],
+    [Input('pair-dropdown', 'value'),
+     Input('update-pair-btn', 'n_clicks')],
+    [dash.State('pairs-store', 'data'),
+     dash.State('analysis-start-date', 'date'),
+     dash.State('analysis-end-date', 'date')]
 )
-def update_pair_analysis(selected_pair, pairs_data):
+def update_pair_analysis(selected_pair, update_clicks, pairs_data, analysis_start, analysis_end):
     empty_fig = create_styled_figure()
+    period_text = f"{pairs_data['start_date']} to {pairs_data['end_date']}" if pairs_data else "No data"
     
     if not selected_pair or not pairs_data:
-        return html.P("🔍 Select a pair to analyze", style={'color': colors['text'], 'textAlign': 'center'}), empty_fig, empty_fig
+        return html.P("🔍 Select a pair to analyze", style={'color': colors['text'], 'textAlign': 'center'}), empty_fig, empty_fig, period_text
+    
+    # Use analysis dates if provided, otherwise fall back to screening dates
+    start_date = analysis_start if analysis_start else pairs_data['start_date']
+    end_date = analysis_end if analysis_end else pairs_data['end_date']
+    
+    # Update period display
+    period_text = f"{start_date} to {end_date}"
     
     # Parse selected assets (can be pair or triplet)
     assets = selected_pair.split('|')
     
-    # Get data for all assets
-    start_date = pairs_data['start_date']
-    end_date = pairs_data['end_date']
+    # Get data for the analysis period
     pair_data = get_pair_data(assets, start_date, end_date)
     
     if len(pair_data) < 2:
-        return html.P("❌ Error loading asset data", style={'color': colors['warning']}), empty_fig, empty_fig
+        return html.P("❌ Error loading asset data for analysis period", style={'color': colors['warning']}), empty_fig, empty_fig, period_text
     
     # For display purposes, use first two assets for spread analysis
     main_assets = assets[:2]
@@ -962,36 +1018,86 @@ def update_pair_analysis(selected_pair, pairs_data):
     stats = calculate_spread_and_stats(main_pair_data)
     
     if not stats:
-        return html.P("❌ Error calculating statistics", style={'color': colors['warning']}), empty_fig, empty_fig
+        return html.P("❌ Error calculating statistics for analysis period", style={'color': colors['warning']}), empty_fig, empty_fig, period_text
     
-    # Recalculate p-value for all selected assets
+    # Recalculate p-value for the analysis period
     try:
-        p_val = multi_cointegration_test(pair_data)['p_value']
+        cointegration_result = multi_cointegration_test(pair_data)
+        p_val = cointegration_result['p_value']
         if len(assets) > 2:
             test_type = "Johansen (multivariate)"
         else:
             test_type = "Phillips-Ouliaris (pairwise)"
-    except:
+            
+        # Additional statistics from cointegration test
+        if 'critical_values' in cointegration_result:
+            crit_vals = cointegration_result['critical_values']
+            is_significant_1pct = p_val < 0.01
+            is_significant_5pct = p_val < 0.05
+            is_significant_10pct = p_val < 0.10
+        else:
+            crit_vals = None
+            is_significant_1pct = is_significant_5pct = is_significant_10pct = False
+            
+    except Exception as e:
         p_val = "N/A"
         test_type = "Error"
+        crit_vals = None
+        is_significant_1pct = is_significant_5pct = is_significant_10pct = False
+        print(f"Error in cointegration test: {e}")
     
     # Enhanced statistics display
     stock1, stock2 = main_assets
+    r_squared = stats['lr_full'].score(stats['aligned_data'][stock2].values.reshape(-1, 1), stats['aligned_data'][stock1].values)
+    
     stats_div = [
         html.Div([
             html.H5(f"📊 {' ↔ '.join(assets)}", style={'color': colors['accent'], 'marginBottom': '15px'}),
+            
+            # Cointegration Test Results
             html.Div([
-                html.P([html.Strong("Test Type: "), test_type], style={'color': colors['text'], 'marginBottom': '8px'}),
+                html.H6("🧪 Cointegration Test", style={'color': colors['info'], 'marginBottom': '10px'}),
+                html.P([html.Strong("Test Type: "), test_type], style={'color': colors['text'], 'marginBottom': '5px'}),
                 html.P([
                     html.Strong("P-value: "), 
                     html.Span(f"{p_val:.6f}" if isinstance(p_val, float) else f"{p_val}", 
                              style={'color': colors['success'] if isinstance(p_val, float) and p_val < 0.05 else colors['warning']})
-                ], style={'marginBottom': '8px'}),
-                html.P([html.Strong("Correlation: "), f"{stats['correlation']:.4f}"], style={'color': colors['text'], 'marginBottom': '8px'}),
-                html.P([html.Strong("Beta (spread): "), f"{stats['beta_spread']:.4f}"], style={'color': colors['text'], 'marginBottom': '8px'}),
-                html.P([html.Strong("Full period β: "), f"{stats['lr_full'].coef_[0]:.4f}"], style={'color': colors['text'], 'marginBottom': '8px'}),
-                html.P([html.Strong("R²: "), f"{stats['lr_full'].score(stats['aligned_data'][stock2].values.reshape(-1, 1), stats['aligned_data'][stock1].values):.4f}"], style={'color': colors['text']})
-            ])
+                ], style={'marginBottom': '5px'}),
+                
+                # Significance levels
+                html.Div([
+                    html.P([
+                        html.Span("✅" if is_significant_1pct else "❌", style={'marginRight': '5px'}),
+                        "Significant at 1% level"
+                    ], style={'color': colors['success'] if is_significant_1pct else colors['text'], 'marginBottom': '3px', 'fontSize': '0.9rem'}),
+                    html.P([
+                        html.Span("✅" if is_significant_5pct else "❌", style={'marginRight': '5px'}),
+                        "Significant at 5% level"
+                    ], style={'color': colors['success'] if is_significant_5pct else colors['text'], 'marginBottom': '3px', 'fontSize': '0.9rem'}),
+                    html.P([
+                        html.Span("✅" if is_significant_10pct else "❌", style={'marginRight': '5px'}),
+                        "Significant at 10% level"
+                    ], style={'color': colors['success'] if is_significant_10pct else colors['text'], 'marginBottom': '10px', 'fontSize': '0.9rem'})
+                ])
+            ], style={'marginBottom': '15px', 'padding': '10px', 'backgroundColor': 'rgba(64,224,208,0.1)', 'borderRadius': '5px'}),
+            
+            # Regression Statistics
+            html.Div([
+                html.H6("📈 Regression Statistics", style={'color': colors['info'], 'marginBottom': '10px'}),
+                html.P([html.Strong("Correlation: "), f"{stats['correlation']:.4f}"], style={'color': colors['text'], 'marginBottom': '5px'}),
+                html.P([html.Strong("R²: "), f"{r_squared:.4f}"], style={'color': colors['text'], 'marginBottom': '5px'}),
+                html.P([html.Strong("Beta (spread): "), f"{stats['beta_spread']:.4f}"], style={'color': colors['text'], 'marginBottom': '5px'}),
+                html.P([html.Strong("Full period β: "), f"{stats['lr_full'].coef_[0]:.4f}"], style={'color': colors['text']})
+            ], style={'marginBottom': '15px', 'padding': '10px', 'backgroundColor': 'rgba(255,165,0,0.1)', 'borderRadius': '5px'}),
+            
+            # Spread Statistics
+            html.Div([
+                html.H6("📊 Spread Statistics", style={'color': colors['info'], 'marginBottom': '10px'}),
+                html.P([html.Strong("Mean: "), f"{stats['spread'].mean():.4f}"], style={'color': colors['text'], 'marginBottom': '5px'}),
+                html.P([html.Strong("Std Dev: "), f"{stats['spread'].std():.4f}"], style={'color': colors['text'], 'marginBottom': '5px'}),
+                html.P([html.Strong("Min: "), f"{stats['spread'].min():.4f}"], style={'color': colors['text'], 'marginBottom': '5px'}),
+                html.P([html.Strong("Max: "), f"{stats['spread'].max():.4f}"], style={'color': colors['text']})
+            ], style={'padding': '10px', 'backgroundColor': 'rgba(0,255,127,0.1)', 'borderRadius': '5px'})
         ])
     ]
     
@@ -1035,7 +1141,7 @@ def update_pair_analysis(selected_pair, pairs_data):
     
     scatter_fig.update_layout(
         title=dict(
-            text=f"{stock1} vs {stock2} • R² = {stats['lr_full'].score(stats['aligned_data'][stock2].values.reshape(-1, 1), stats['aligned_data'][stock1].values):.3f}",
+            text=f"{stock1} vs {stock2} • R² = {r_squared:.3f} • p = {p_val:.4f}" if isinstance(p_val, float) else f"{stock1} vs {stock2} • R² = {r_squared:.3f}",
             x=0.5
         ),
         xaxis_title=f"{stock2} Price ($)",
@@ -1100,9 +1206,10 @@ def update_pair_analysis(selected_pair, pairs_data):
         line_width=0
     )
     
+    # Add period information to spread plot title
     spread_fig.update_layout(
         title=dict(
-            text=f"Spread: {stock1} - {stats['beta_spread']:.4f} × {stock2}",
+            text=f"Spread: {stock1} - {stats['beta_spread']:.4f} × {stock2} | Period: {start_date} to {end_date}",
             x=0.5
         ),
         xaxis_title="Date",
@@ -1110,7 +1217,7 @@ def update_pair_analysis(selected_pair, pairs_data):
         height=400
     )
     
-    return stats_div, scatter_fig, spread_fig
+    return stats_div, scatter_fig, spread_fig, period_text
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=8050) 
