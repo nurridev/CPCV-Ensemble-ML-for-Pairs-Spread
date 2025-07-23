@@ -19,81 +19,211 @@ from statsmodels.tsa.stattools import coint
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
 from tqdm import tqdm
 DIRECTORY = '/home/kisero/ML-shyt-public/stock_data/'
-LOOKBACK  = 100 # Input into autoencoder
 VECTOR_UNIVERSE = {}
+
+import numpy as np
+import pandas as pd
+from statsmodels.tsa.stattools import coint
+from statsmodels.tsa.vector_ar.vecm import coint_johansen
+
+
+def _hurst_exponent(ts, lags_range=range(2, 100)):
+    """Compute the Hurst exponent of a time series using a simple R/S method.
+
+    Parameters
+    ----------
+    ts : array‑like
+        1‑D sequence of numeric observations.
+    lags_range : iterable of int, optional
+        Sequence of lags over which to compute the rescaled range.  The default
+        range(2, 100) gives a quick yet reasonably stable estimate.  Increase
+        the upper bound for a more precise but slower calculation.
+
+    Returns
+    -------
+    float
+        Estimated Hurst exponent H where:
+        * H < 0.5  → anti‑persistent / mean‑reverting
+        * H ≈ 0.5  → uncorrelated / random walk
+        * H > 0.5  → persistent / trending
+    """
+    ts = np.asarray(ts, dtype=float)
+    lags = np.asarray(list(lags_range))
+    # Compute tau for each lag: sqrt of the variance of lagged differences
+    tau = [np.sqrt(np.var(ts[lag:] - ts[:-lag])) for lag in lags]
+    # Linear fit of log(lag) vs log(tau) → slope = H/2
+    slope, _ = np.polyfit(np.log(lags), np.log(tau), 1)
+    return 2.0 * slope
+
+
+def _hurst_exponent(ts, lags_range=range(2, 100)):
+    '''Compute the (global) Hurst exponent of a time‑series using a simple
+    R/S‑style log‑log regression on the standard deviation of lagged differences.
+    Returns
+    -------
+    float
+        Estimated Hurst exponent H \in (0,1). 0.5 ≈ random walk; <0.5 mean‑reverting;
+        >0.5 trending/persistent.'''  # noqa: E501
+    ts = np.asarray(ts)
+    if ts.ndim != 1:
+        raise ValueError('`ts` must be 1‑dimensional')
+    # Standard deviation of differenced series at multiple lags
+    tau = [np.sqrt(np.std(np.subtract(ts[lag:], ts[:-lag]))) for lag in lags_range]
+    # Linear regression in log‑space: log(tau) = c + H * log(lag)
+    poly = np.polyfit(np.log(lags_range), np.log(tau), 1)
+    hurst = 2.0 * poly[0]
+    return float(hurst)
+
+
+def _kalman_spread(y: pd.Series, x: pd.Series, q=.0005, r=.0005) -> pd.Series:
+    '''Estimate a dynamic hedge ratio β_t and intercept α_t between two series
+    via a simple 2‑state Kalman filter, then return the resulting spread
+
+        spread_t = y_t − β_t * x_t − α_t
+
+    Parameters
+    ----------
+    y, x : pd.Series (must be aligned)
+    q : float, optional
+        Process (state‑transition) noise variance. Larger → more time‑varying β/α.
+    r : float, optional
+        Observation noise variance.
+
+    Returns
+    -------
+    pd.Series
+        The inferred spread series (same index as inputs).'''  # noqa: E501
+    if not y.index.equals(x.index):
+        raise ValueError('Series indices must match for Kalman filter regression.')
+
+    n = len(y)
+    # State vector [β, α]
+    state = np.zeros(2)
+    P = np.eye(2)  # State covariance
+    Q = q * np.eye(2)
+    R = r
+    beta, alpha = np.zeros(n), np.zeros(n)
+
+    for t in range(n):
+        # ---- Prediction ----
+        P = P + Q  # F = I, so x̂ = x, P̂ = P + Q
+
+        # ---- Update ----
+        H = np.array([x.iloc[t], 1.0]).reshape(1, 2)  # Observation matrix
+        y_pred = (H @ state.reshape(-1, 1))[0, 0]
+        S = (H @ P @ H.T)[0, 0] + R
+        K = (P @ H.T).flatten() / S  # Kalman gain (2‑vector)
+
+        state = state + K * (y.iloc[t] - y_pred)
+        P = (np.eye(2) - np.outer(K, H)) @ P
+
+        beta[t], alpha[t] = state  # Save for inspection if needed
+
+    spread = y - beta * x - alpha
+    return pd.Series(spread, index=y.index, name='spread')
+
+
 
 def multi_cointegration_test(
     data_dict,
-    det_order=0,
-    k_ar_diff=1,
-    significance=0.05
+    det_order: int = 0,
+    k_ar_diff: int = 1,
+    significance: float = 0.05,
 ):
-    """
-    Test cointegration among N time series provided as lists, arrays, or pandas Series.
+    '''
+    Test for cointegration among ≥2 time‑series AND compute a *single* Hurst
+    exponent on the resulting spread.
 
-    - If N == 2: runs Phillips–Ouliaris (statsmodels.tsa.stattools.coint)
-    - If N >= 3: runs Johansen test (statsmodels.tsa.vector_ar.vecm.coint_johansen)
+    Workflow
+    --------
+    • N = 2  →  Phillips–Ouliaris coint test + Kalman filter regression to
+               extract a dynamic spread (y|x)  →  Hurst(spread).
+    • N ≥ 3 →  Johansen trace test. The first cointegration vector (column 0)
+               is used to form a static spread  →  Hurst(spread).
 
-              }
-    """
-    # 1) Convert inputs to pandas Series
-    series_dict = {}
-    for label, series in data_dict.items():
-        if isinstance(series, pd.Series):
-            series_dict[label] = series
-        else:
-            series_dict[label] = pd.Series(series)
+    Returns
+    -------
+    dict
+        Always contains keys:
+          • 'type'                – 'pairwise' | 'johansen'
+          • 'hurst_exponent'      – float, H(spread)
+          • 'spread'              – pd.Series of the derived spread
+        …plus the usual statistics from the chosen cointegration test.
+    '''  # noqa: E501
 
-    # 2) Align into a DataFrame and drop missing
+    # 1) Normalise input → aligned DataFrame
+    series_dict = {lbl: (ser if isinstance(ser, pd.Series) else pd.Series(ser))
+                   for lbl, ser in data_dict.items()}
     df = pd.concat(series_dict, axis=1).dropna()
     n = df.shape[1]
 
-    # 3) Two-series case: Phillips-Ouliaris cointegration test
+    if n < 2:
+        raise ValueError('Need at least two series for cointegration analysis.')
+
+    # -------------------------- Pairwise (N = 2) --------------------------- #
     if n == 2:
         y, x = df.iloc[:, 0], df.iloc[:, 1]
+        # Kalman‑filter spread & Hurst
+        spread = _kalman_spread(y, x)
+        hurst = _hurst_exponent(spread.dropna())
+
+        # Phillips–Ouliaris test
         t_stat, p_value, crit_vals = coint(y, x)
         return {
             'type': 'pairwise',
-            't_stat': t_stat,
-            'p_value': p_value,
+            't_stat': float(t_stat),
+            'p_value': float(p_value),
             'critical_values': {'1%': crit_vals[0], '5%': crit_vals[1], '10%': crit_vals[2]},
-            'is_cointegrated': p_value < significance
+            'is_cointegrated': bool(p_value < significance),
+            'spread_method': 'kalman',
+            'spread': spread,
+            'hurst_exponent': hurst,
         }
 
-    # 4) Multivariate case (>=3 series): Johansen test
+    # ------------------------ Multivariate (N ≥ 3) ------------------------- #
     joh = coint_johansen(df, det_order, k_ar_diff)
-    # Choose critical value column based on significance
+
+    # Map α to critical‑value column
     sig_to_col = {0.10: 0, 0.05: 1, 0.01: 2}
     cv_col = sig_to_col.get(significance, 1)
 
-    # Determine cointegration rank using trace statistic
+    # Trace‑statistic rank selection
     rank = 0
-    for i, trace_stat in enumerate(joh.lr1):
-        if trace_stat > joh.cvt[i, cv_col]:
+    for stat, cv in zip(joh.lr1, joh.cvt[:, cv_col]):
+        if stat > cv:
             rank += 1
         else:
             break
 
+    # Use first cointegration vector to derive *static* spread
+    coint_vec = joh.evec[:, 0]
+    spread_values = df.values @ coint_vec
+    spread = pd.Series(spread_values, index=df.index, name='spread')
+    hurst = _hurst_exponent(spread)
+
     return {
         'type': 'johansen',
-        'nobs': df.shape[0],
+        'nobs': int(df.shape[0]),
         'variables': list(df.columns),
-        'trace_stat': list(joh.lr1),
+        'trace_stat': list(map(float, joh.lr1)),
         'trace_cv': {
-            '90%': list(joh.cvt[:, 0]),
-            '95%': list(joh.cvt[:, 1]),
-            '99%': list(joh.cvt[:, 2])
+            '90%': list(map(float, joh.cvt[:, 0])),
+            '95%': list(map(float, joh.cvt[:, 1])),
+            '99%': list(map(float, joh.cvt[:, 2])),
         },
-        'maxeig_stat': list(joh.lr2),
+        'maxeig_stat': list(map(float, joh.lr2)),
         'maxeig_cv': {
-            '90%': list(joh.cvm[:, 0]),
-            '95%': list(joh.cvm[:, 1]),
-            '99%': list(joh.cvm[:, 2])
+            '90%': list(map(float, joh.cvm[:, 0])),
+            '95%': list(map(float, joh.cvm[:, 1])),
+            '99%': list(map(float, joh.cvm[:, 2])),
         },
-        'eigenvalues': list(joh.eig),
-        'cointegration_rank': rank
+        'eigenvalues': list(map(float, joh.eig)),
+        'cointegration_rank': int(rank),
+        'spread_method': 'johansen_first_vec',
+        'spread_vector': list(map(float, coint_vec)),
+        'spread': spread,
+        'hurst_exponent': hurst,
     }
-
 # AUTOENCODING
 def build_model(output_len):
     model = Sequential([
@@ -185,7 +315,7 @@ def train_autoencoder(LOOKBACK, start, end, stride, model):
         vector_universe[stock_name] = stock_vect.tolist()
     return vector_universe, encoder        
 # CLUSTERING
-def cluster_pvals(vector_universe, start_date, end_date, alpha):
+def cluster_pvals(vector_universe, start_date, end_date, alpha, hurst):
     """
     -Given vector_universe ->  {'Stock_name':[samples, latent_vector], 'Stock_name':...}
     -Returns
@@ -227,22 +357,22 @@ def cluster_pvals(vector_universe, start_date, end_date, alpha):
             df = df[start_date:end_date] 
             df.index = pd.to_datetime(df.index) # Sets first column to datetime 
             asset_data[name] = df.Close.to_list() 
-        
-        p_val = multi_cointegration_test(asset_data)['p_value']
-        final_p_vals[assets] = p_val 
-    top_vals = [(item[0], item[1]) for item in final_p_vals.items() if item[1] <= alpha] # ((asset1,asset2), p_val)
+        coint_info_test = multi_cointegration_test(asset_data) 
+         
+        final_p_vals[assets] = (coint_info_test['p_value'], coint_info_test['hurst_exponent'])
+    top_vals = [(item[0], item[1][0], item[1][1]) for item in final_p_vals.items() if item[1][0] <= alpha and item[1][1] <= hurst] # ((asset1,asset2), (p_val, hurst)), (...)
     print(top_vals)
     return top_vals 
 # FINAL LOOP 
 
 lookback = 256
-start_date = '2014-01-01'
-end_date   = '2020-01-01'
+start_date = '2012-01-01'
+end_date   = '2018-01-01'
 model = build_model(lookback)
 if __name__ == "__main__":
     
     vector_universe, encoder = train_autoencoder(lookback, start_date, end_date, 64, model) # autoencodes vector Universe from directory
     with open("encoder.pkl", "wb") as f:
         pickle.dump(encoder, f) 
-    clus = cluster_pvals(vector_universe, start_date, end_date, .1) # Cluster vector universe 
+    clus = cluster_pvals(vector_universe, start_date, end_date, .1, .5) # Cluster vector universe 
 
