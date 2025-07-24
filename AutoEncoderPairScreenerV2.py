@@ -17,6 +17,7 @@ import pandas as pd
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import coint
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
+from statsmodels.tsa.stattools import adfuller, kpss
 from tqdm import tqdm
 DIRECTORY = '/home/kisero/ML-shyt-public/stock_data/'
 VECTOR_UNIVERSE = {}
@@ -27,202 +28,83 @@ from statsmodels.tsa.stattools import coint
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
 
 
-def _hurst_exponent(ts, lags_range=range(2, 100)):
-    """Compute the Hurst exponent of a time series using a simple R/S method.
-
-    Parameters
-    ----------
-    ts : array‑like
-        1‑D sequence of numeric observations.
-    lags_range : iterable of int, optional
-        Sequence of lags over which to compute the rescaled range.  The default
-        range(2, 100) gives a quick yet reasonably stable estimate.  Increase
-        the upper bound for a more precise but slower calculation.
-
-    Returns
-    -------
-    float
-        Estimated Hurst exponent H where:
-        * H < 0.5  → anti‑persistent / mean‑reverting
-        * H ≈ 0.5  → uncorrelated / random walk
-        * H > 0.5  → persistent / trending
-    """
-    ts = np.asarray(ts, dtype=float)
-    lags = np.asarray(list(lags_range))
-    # Compute tau for each lag: sqrt of the variance of lagged differences
-    tau = [np.sqrt(np.var(ts[lag:] - ts[:-lag])) for lag in lags]
-    # Linear fit of log(lag) vs log(tau) → slope = H/2
-    slope, _ = np.polyfit(np.log(lags), np.log(tau), 1)
-    return 2.0 * slope
-
-
-def _hurst_exponent(ts, lags_range=range(2, 100)):
-    '''Compute the (global) Hurst exponent of a time‑series using a simple
-    R/S‑style log‑log regression on the standard deviation of lagged differences.
-    Returns
-    -------
-    float
-        Estimated Hurst exponent H \in (0,1). 0.5 ≈ random walk; <0.5 mean‑reverting;
-        >0.5 trending/persistent.'''  # noqa: E501
-    ts = np.asarray(ts)
-    if ts.ndim != 1:
-        raise ValueError('`ts` must be 1‑dimensional')
-    # Standard deviation of differenced series at multiple lags
-    tau = [np.sqrt(np.std(np.subtract(ts[lag:], ts[:-lag]))) for lag in lags_range]
-    # Linear regression in log‑space: log(tau) = c + H * log(lag)
-    poly = np.polyfit(np.log(lags_range), np.log(tau), 1)
-    hurst = 2.0 * poly[0]
-    return float(hurst)
-
-
-def _kalman_spread(y: pd.Series, x: pd.Series, q=.0005, r=.0005) -> pd.Series:
-    '''Estimate a dynamic hedge ratio β_t and intercept α_t between two series
-    via a simple 2‑state Kalman filter, then return the resulting spread
-
-        spread_t = y_t − β_t * x_t − α_t
-
-    Parameters
-    ----------
-    y, x : pd.Series (must be aligned)
-    q : float, optional
-        Process (state‑transition) noise variance. Larger → more time‑varying β/α.
-    r : float, optional
-        Observation noise variance.
-
-    Returns
-    -------
-    pd.Series
-        The inferred spread series (same index as inputs).'''  # noqa: E501
-    if not y.index.equals(x.index):
-        raise ValueError('Series indices must match for Kalman filter regression.')
-
+def kalman_spread(y, x, q=1e-5, r=1e-3):
+    y = np.asarray(y, dtype=float)
+    x = np.asarray(x, dtype=float)
     n = len(y)
-    # State vector [β, α]
-    state = np.zeros(2)
-    P = np.eye(2)  # State covariance
-    Q = q * np.eye(2)
-    R = r
-    beta, alpha = np.zeros(n), np.zeros(n)
+
+    beta_hat = np.zeros(n)
+    P = 1.0
 
     for t in range(n):
-        # ---- Prediction ----
-        P = P + Q  # F = I, so x̂ = x, P̂ = P + Q
+        xt = x[t]
 
-        # ---- Update ----
-        H = np.array([x.iloc[t], 1.0]).reshape(1, 2)  # Observation matrix
-        y_pred = (H @ state.reshape(-1, 1))[0, 0]
-        S = (H @ P @ H.T)[0, 0] + R
-        K = (P @ H.T).flatten() / S  # Kalman gain (2‑vector)
+        # Predict
+        beta_pred = beta_hat[t-1] if t > 0 else 0.0
+        P = P + q
 
-        state = state + K * (y.iloc[t] - y_pred)
-        P = (np.eye(2) - np.outer(K, H)) @ P
+        # Update
+        err = y[t] - beta_pred * xt
+        S = xt * P * xt + r
+        K = P * xt / S
+        beta_new = beta_pred + K * err
+        P = (1 - K * xt) * P
 
-        beta[t], alpha[t] = state  # Save for inspection if needed
+        beta_hat[t] = beta_new
 
-    spread = y - beta * x - alpha
-    return pd.Series(spread, index=y.index, name='spread')
+    spread = y - beta_hat * x
+    return beta_hat, spread
 
+# ---------- Unit-root tests ----------
+def run_adf(series):
+    stat, p, _, _, _, _ = adfuller(series, autolag='AIC')
+    return {"stat": stat, "p": p}
 
+def run_kpss(series):
+    stat, p, _, _ = kpss(series, regression='c', nlags='auto')
+    return {"stat": stat, "p": p}
 
-def multi_cointegration_test(
-    data_dict,
-    det_order: int = 0,
-    k_ar_diff: int = 1,
-    significance: float = 0.05,
-):
-    '''
-    Test for cointegration among ≥2 time‑series AND compute a *single* Hurst
-    exponent on the resulting spread.
+# ---------- Johansen with boolean significance ----------
+def run_johansen(df, det_order=0, k_ar_diff=1):
+    j = coint_johansen(df, det_order, k_ar_diff)
 
-    Workflow
-    --------
-    • N = 2  →  Phillips–Ouliaris coint test + Kalman filter regression to
-               extract a dynamic spread (y|x)  →  Hurst(spread).
-    • N ≥ 3 →  Johansen trace test. The first cointegration vector (column 0)
-               is used to form a static spread  →  Hurst(spread).
-
-    Returns
-    -------
-    dict
-        Always contains keys:
-          • 'type'                – 'pairwise' | 'johansen'
-          • 'hurst_exponent'      – float, H(spread)
-          • 'spread'              – pd.Series of the derived spread
-        …plus the usual statistics from the chosen cointegration test.
-    '''  # noqa: E501
-
-    # 1) Normalise input → aligned DataFrame
-    series_dict = {lbl: (ser if isinstance(ser, pd.Series) else pd.Series(ser))
-                   for lbl, ser in data_dict.items()}
-    df = pd.concat(series_dict, axis=1).dropna()
-    n = df.shape[1]
-
-    if n < 2:
-        raise ValueError('Need at least two series for cointegration analysis.')
-
-    # -------------------------- Pairwise (N = 2) --------------------------- #
-    if n == 2:
-        y, x = df.iloc[:, 0], df.iloc[:, 1]
-        # Kalman‑filter spread & Hurst
-        spread = _kalman_spread(y, x)
-        hurst = _hurst_exponent(spread.dropna())
-
-        # Phillips–Ouliaris test
-        t_stat, p_value, crit_vals = coint(y, x)
-        return {
-            'type': 'pairwise',
-            't_stat': float(t_stat),
-            'p_value': float(p_value),
-            'critical_values': {'1%': crit_vals[0], '5%': crit_vals[1], '10%': crit_vals[2]},
-            'is_cointegrated': bool(p_value < significance),
-            'spread_method': 'kalman',
-            'spread': spread,
-            'hurst_exponent': hurst,
-        }
-
-    # ------------------------ Multivariate (N ≥ 3) ------------------------- #
-    joh = coint_johansen(df, det_order, k_ar_diff)
-
-    # Map α to critical‑value column
-    sig_to_col = {0.10: 0, 0.05: 1, 0.01: 2}
-    cv_col = sig_to_col.get(significance, 1)
-
-    # Trace‑statistic rank selection
-    rank = 0
-    for stat, cv in zip(joh.lr1, joh.cvt[:, cv_col]):
-        if stat > cv:
-            rank += 1
-        else:
-            break
-
-    # Use first cointegration vector to derive *static* spread
-    coint_vec = joh.evec[:, 0]
-    spread_values = df.values @ coint_vec
-    spread = pd.Series(spread_values, index=df.index, name='spread')
-    hurst = _hurst_exponent(spread)
+    # Criticals are shaped (r, 3) for 90/95/99
+    levels = {"90": 0, "95": 1, "99": 2}
+    trace_reject = {lv: (j.lr1 > j.cvt[:, idx]) for lv, idx in levels.items()}
+    eigen_reject = {lv: (j.lr2 > j.cvm[:, idx]) for lv, idx in levels.items()}
 
     return {
-        'type': 'johansen',
-        'nobs': int(df.shape[0]),
-        'variables': list(df.columns),
-        'trace_stat': list(map(float, joh.lr1)),
-        'trace_cv': {
-            '90%': list(map(float, joh.cvt[:, 0])),
-            '95%': list(map(float, joh.cvt[:, 1])),
-            '99%': list(map(float, joh.cvt[:, 2])),
-        },
-        'maxeig_stat': list(map(float, joh.lr2)),
-        'maxeig_cv': {
-            '90%': list(map(float, joh.cvm[:, 0])),
-            '95%': list(map(float, joh.cvm[:, 1])),
-            '99%': list(map(float, joh.cvm[:, 2])),
-        },
-        'eigenvalues': list(map(float, joh.eig)),
-        'cointegration_rank': int(rank),
-        'spread_method': 'johansen_first_vec',
-        'spread_vector': list(map(float, coint_vec)),
-        'spread': spread,
-        'hurst_exponent': hurst,
+        "trace_stat": j.lr1,
+        "trace_crit": j.cvt,     # keep if you still want numbers
+        "eigen_stat": j.lr2,
+        "eigen_crit": j.cvm,
+        "trace_reject": trace_reject,
+        "eigen_reject": eigen_reject
+    }
+
+# ---------- Main wrapper ----------
+def compute_metrics(price_dict, y_key=None, x_key=None):
+    if y_key is None or x_key is None:
+        keys = list(price_dict.keys())
+        y_key, x_key = keys[0], keys[1]
+
+    y = np.asarray(price_dict[y_key], dtype=float)
+    x = np.asarray(price_dict[x_key], dtype=float)
+
+    beta_hat, spread = kalman_spread(y, x)
+
+    adf_res   = run_adf(spread)
+    kpss_res  = run_kpss(spread)
+    df_pair   = pd.DataFrame({y_key: y, x_key: x})
+    joh_res   = run_johansen(df_pair)
+
+    return {
+        "kalman": {"beta": beta_hat, "spread": spread},
+        "tests": {
+            "adf": adf_res,
+            "kpss": kpss_res,
+            "johansen": joh_res
+        }
     }
 # AUTOENCODING
 def build_model(output_len):
@@ -302,7 +184,7 @@ def train_autoencoder(LOOKBACK, start, end, stride, model):
         x = y = [x[sample_idx] for sample_idx in range(len(x)) if sample_idx not in [idx1,idx2,idx3]] 
         x, y = np.array(x), np.array(y) 
         early_stop = EarlyStopping(monitor='loss', patience=8, restore_best_weights=True) # earlystop function
-        model.fit(np.array(x), np.array(y) , epochs=10000, validation_data=(x_val, y_val), callbacks=early_stop) # Fit model with earling stopping callback
+        model.fit(np.array(x), np.array(y) , epochs=1, validation_data=(x_val, y_val), callbacks=early_stop) # Fit model with earling stopping callback
         # Encode newest data
         encoder = Sequential()
         for i in range(6): #range(n) where n is layer of latent space
@@ -315,7 +197,7 @@ def train_autoencoder(LOOKBACK, start, end, stride, model):
         vector_universe[stock_name] = stock_vect.tolist()
     return vector_universe, encoder        
 # CLUSTERING
-def cluster_pvals(vector_universe, start_date, end_date, alpha, hurst):
+def cluster_pvals(vector_universe, start_date, end_date, alpha):
     """
     -Given vector_universe ->  {'Stock_name':[samples, latent_vector], 'Stock_name':...}
     -Returns
@@ -356,11 +238,17 @@ def cluster_pvals(vector_universe, start_date, end_date, alpha, hurst):
             df = pd.read_csv(DIRECTORY + [f for f in files if name in f][0], index_col=0)
             df = df[start_date:end_date] 
             df.index = pd.to_datetime(df.index) # Sets first column to datetime 
-            asset_data[name] = df.Close.to_list() 
-        coint_info_test = multi_cointegration_test(asset_data) 
-         
-        final_p_vals[assets] = (coint_info_test['p_value'], coint_info_test['hurst_exponent'])
-    top_vals = [(item[0], item[1][0], item[1][1]) for item in final_p_vals.items() if item[1][0] <= alpha and item[1][1] <= hurst] # ((asset1,asset2), (p_val, hurst)), (...)
+            asset_data[name] = df.Close.to_list()
+        # Check length
+        length_ind = [len(item) for key, item in asset_data.items()] 
+        aligned_length = all(x == length_ind[0] for x in length_ind) 
+        if aligned_length:
+            coint_info_test = compute_metrics(asset_data) 
+            #final_p_vals[assets] = coint_info
+            asset_data[name] = coint_info_test['tests']['adf']['p'], coint_info_test['tests']['kpss']['p'], coint_info_test['tests']['johansen']['trace_reject']['95'][0]
+        else:
+            print(f"Could not eval {asset_data.keys()}")
+    top_vals = [(item[0], item[1]) for item in final_p_vals.items() if item[1][0] <= alpha and item[1][1] <= 1-alpha*2 and item[1][2]] # ((asset1,asset2), (adf-float, kpss-float, johansen-bool))
     print(top_vals)
     return top_vals 
 # FINAL LOOP 
@@ -374,5 +262,5 @@ if __name__ == "__main__":
     vector_universe, encoder = train_autoencoder(lookback, start_date, end_date, 64, model) # autoencodes vector Universe from directory
     with open("encoder.pkl", "wb") as f:
         pickle.dump(encoder, f) 
-    clus = cluster_pvals(vector_universe, start_date, end_date, .1, .5) # Cluster vector universe 
+    clus = cluster_pvals(vector_universe, start_date, end_date, .1) # Cluster vector universe 
 
