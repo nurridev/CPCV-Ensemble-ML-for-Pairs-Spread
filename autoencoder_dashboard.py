@@ -269,10 +269,10 @@ def train_autoencoder(LOOKBACK, start, end, stride, model, data_directory='./sto
             df_price = df['Close']
             
             if len(df_price) < LOOKBACK * 3:
-                print(f'COULD NOT EVAL {file_name}: {len(df_price)}') 
+                logger.warning(f'COULD NOT EVAL {file_name}: {len(df_price)} - insufficient data') 
                 continue
                 
-            print(f"Loaded {file_name} {len(df_price)}") 
+            logger.info(f"Processing {file_name} with {len(df_price)} data points") 
             
             # Rolling z-score
             rolling_mean = df_price.rolling(window=LOOKBACK).mean()
@@ -280,18 +280,35 @@ def train_autoencoder(LOOKBACK, start, end, stride, model, data_directory='./sto
             rolling_zscore = (df_price - rolling_mean) / rolling_std
             rolling_zscore = rolling_zscore.dropna(how='all').to_list()
             
+            if len(rolling_zscore) < LOOKBACK + 6:  # Need enough data for validation
+                logger.warning(f'COULD NOT EVAL {file_name}: insufficient zscore data after rolling calculation')
+                continue
+            
             x = y = stride_window(stride, rolling_zscore, LOOKBACK)
             
-            # Random validation sets
-            idx1, idx2, idx3 = random.sample(range(1, len(x) - 2), 3) 
+            if len(x) < 6:  # Need minimum samples for validation
+                logger.warning(f'COULD NOT EVAL {file_name}: insufficient samples after stride windowing')
+                continue
+            
+            # Random validation sets with bounds checking
+            available_indices = list(range(1, len(x) - 2))
+            if len(available_indices) < 3:
+                logger.warning(f'COULD NOT EVAL {file_name}: insufficient indices for validation split')
+                continue
+                
+            idx1, idx2, idx3 = random.sample(available_indices, 3) 
             x_val = y_val = np.array([x[idx1], x[idx2], x[idx3]])
             
             # Remove validation from training
             x = y = [x[sample_idx] for sample_idx in range(len(x)) if sample_idx not in [idx1, idx2, idx3]] 
             x, y = np.array(x), np.array(y) 
             
+            if len(x) == 0:
+                logger.warning(f'COULD NOT EVAL {file_name}: no training data after validation split')
+                continue
+            
             early_stop = EarlyStopping(monitor='loss', patience=8, restore_best_weights=True)
-            model.fit(np.array(x), np.array(y), epochs=1, validation_data=(x_val, y_val), callbacks=early_stop)
+            model.fit(np.array(x), np.array(y), epochs=1, validation_data=(x_val, y_val), callbacks=early_stop, verbose=0)
             
             # Create encoder
             encoder = Sequential()
@@ -300,13 +317,32 @@ def train_autoencoder(LOOKBACK, start, end, stride, model, data_directory='./sto
                 
             stock_name = ''.join([letter for letter in file_name if letter.isupper()])
             
-            stock_vect = encoder.predict(x).squeeze()
-            vector_universe[stock_name] = stock_vect.tolist()
+            # Get encoded vectors and ensure consistent shape
+            stock_vect = encoder.predict(x, verbose=0)
+            
+            # Handle different output shapes - flatten to 1D if needed
+            if len(stock_vect.shape) > 2:
+                stock_vect = stock_vect.reshape(stock_vect.shape[0], -1)
+            
+            # Take mean across samples to get a single representative vector per stock
+            if len(stock_vect.shape) == 2:
+                stock_vect_mean = np.mean(stock_vect, axis=0)
+            else:
+                stock_vect_mean = stock_vect
+            
+            # Ensure we have a consistent vector length
+            if hasattr(stock_vect_mean, 'shape') and len(stock_vect_mean.shape) > 0:
+                vector_universe[stock_name] = stock_vect_mean.flatten().tolist()
+                logger.info(f"Successfully processed {stock_name} - vector shape: {len(vector_universe[stock_name])}")
+            else:
+                logger.warning(f'COULD NOT EVAL {file_name}: invalid vector shape')
+                continue
             
         except Exception as e:
-            logger.warning(f"Error processing {file_name}: {e}")
+            logger.error(f"Error processing {file_name}: {e}")
             continue
             
+    logger.info(f"Successfully processed {len(vector_universe)} stocks for vector universe")
     return vector_universe, encoder
 
 # =============================================================================
@@ -561,46 +597,84 @@ class AutoEncoderPairScreenerBackend:
     def _perform_clustering(self, vector_universe: Dict, min_cluster_size: int) -> Dict:
         """Perform HDBSCAN clustering on autoencoded vectors"""
         
-        cluster_model = HDBSCAN(min_cluster_size=min_cluster_size)
-        data_labels = list(vector_universe.keys())
-        vector_data = list(vector_universe.values())
+        if not vector_universe:
+            logger.warning("No vectors available for clustering")
+            return {'pairs': [], 'cluster_labels': {}, 'cluster_groups': {}}
         
-        # Flatten and pad vectors to ensure consistent dimensionality
-        max_len = max(len(v) if isinstance(v, list) else 1 for v in vector_data)
-        processed_vectors = []
-        
-        for v in vector_data:
-            if isinstance(v, list):
+        try:
+            cluster_model = HDBSCAN(min_cluster_size=min_cluster_size)
+            data_labels = list(vector_universe.keys())
+            vector_data = list(vector_universe.values())
+            
+            # Ensure all vectors are lists and have consistent dimensionality
+            processed_vectors = []
+            max_len = 0
+            
+            # First pass: determine max length and validate vectors
+            valid_vectors = []
+            valid_labels = []
+            
+            for i, (label, v) in enumerate(zip(data_labels, vector_data)):
+                try:
+                    if isinstance(v, (list, np.ndarray)):
+                        v_flat = np.array(v).flatten()
+                        if len(v_flat) > 0 and np.all(np.isfinite(v_flat)):
+                            valid_vectors.append(v_flat.tolist())
+                            valid_labels.append(label)
+                            max_len = max(max_len, len(v_flat))
+                        else:
+                            logger.warning(f"Skipping {label}: invalid vector data")
+                    else:
+                        logger.warning(f"Skipping {label}: vector is not a list or array")
+                except Exception as e:
+                    logger.warning(f"Skipping {label}: error processing vector - {e}")
+                    continue
+            
+            if len(valid_vectors) < min_cluster_size:
+                logger.warning(f"Insufficient valid vectors ({len(valid_vectors)}) for clustering")
+                return {'pairs': [], 'cluster_labels': {}, 'cluster_groups': {}}
+            
+            # Second pass: pad all vectors to same length
+            for v in valid_vectors:
                 if len(v) < max_len:
-                    v_padded = v + [0] * (max_len - len(v))
+                    v_padded = v + [0.0] * (max_len - len(v))
                 else:
                     v_padded = v[:max_len]
                 processed_vectors.append(v_padded)
-            else:
-                processed_vectors.append([v] + [0] * (max_len - 1))
-        
-        # Perform clustering
-        cluster_labels = cluster_model.fit_predict(processed_vectors)
-        
-        # Group stocks by cluster
-        cluster_groups = {}
-        for stock, cluster_id in zip(data_labels, cluster_labels):
-            if cluster_id not in cluster_groups:
-                cluster_groups[cluster_id] = []
-            cluster_groups[cluster_id].append(stock)
-        
-        # Generate pairs from clusters (excluding noise cluster -1)
-        pairs = []
-        for cluster_id, stocks in cluster_groups.items():
-            if cluster_id != -1 and len(stocks) >= 2:
-                cluster_pairs = list(combinations(stocks, 2))
-                pairs.extend(cluster_pairs)
-        
-        return {
-            'pairs': pairs,
-            'cluster_labels': dict(zip(data_labels, cluster_labels)),
-            'cluster_groups': cluster_groups
-        }
+            
+            # Convert to numpy array for clustering
+            processed_vectors = np.array(processed_vectors)
+            logger.info(f"Clustering {len(processed_vectors)} vectors of dimension {max_len}")
+            
+            # Perform clustering
+            cluster_labels = cluster_model.fit_predict(processed_vectors)
+            
+            # Group stocks by cluster
+            cluster_groups = {}
+            for stock, cluster_id in zip(valid_labels, cluster_labels):
+                if cluster_id not in cluster_groups:
+                    cluster_groups[cluster_id] = []
+                cluster_groups[cluster_id].append(stock)
+            
+            # Generate pairs from clusters (excluding noise cluster -1)
+            pairs = []
+            for cluster_id, stocks in cluster_groups.items():
+                if cluster_id != -1 and len(stocks) >= 2:
+                    cluster_pairs = list(combinations(stocks, 2))
+                    pairs.extend(cluster_pairs)
+                    logger.info(f"Cluster {cluster_id}: {len(stocks)} stocks, {len(cluster_pairs)} pairs")
+            
+            logger.info(f"Generated {len(pairs)} pairs from {len(cluster_groups)} clusters")
+            
+            return {
+                'pairs': pairs,
+                'cluster_labels': dict(zip(valid_labels, cluster_labels)),
+                'cluster_groups': cluster_groups
+            }
+            
+        except Exception as e:
+            logger.error(f"Error during clustering: {e}")
+            return {'pairs': [], 'cluster_labels': {}, 'cluster_groups': {}}
     
     def _test_cointegration(
         self, 
@@ -1212,25 +1286,38 @@ def run_analysis(n_clicks, start_date, end_date, alpha, cluster_size):
         
         if results['status'] == 'success':
             if results['pairs']:
-                # Create dropdown options
+                # Create enhanced dropdown options with comprehensive statistics
                 options = []
                 for i, pair_data in enumerate(results['pairs']):
                     stock1, stock2 = pair_data['pair']
                     confidence = pair_data['confidence_score']
                     hurst = pair_data['hurst_exponent']
-                    label = f"{stock1} / {stock2} (Conf: {confidence:.3f}, Hurst: {hurst:.3f})"
+                    adf_p = pair_data['cointegration_tests']['adf_p_value']
+                    kpss_p = pair_data['cointegration_tests']['kpss_p_value']
+                    johansen_reject = pair_data['cointegration_tests']['johansen_reject_95']
+                    data_points = pair_data['data_points']
+                    
+                    # Create comprehensive label with statistics
+                    label = (f"{stock1}/{stock2} | "
+                            f"Conf:{confidence:.3f} | "
+                            f"Hurst:{hurst:.3f} | "
+                            f"ADF:{adf_p:.4f} | "
+                            f"KPSS:{kpss_p:.3f} | "
+                            f"Johan:{'✓' if johansen_reject else '✗'} | "
+                            f"N:{data_points}")
+                    
                     options.append({'label': label, 'value': i})
                 
                 status_msg = html.Div([
                     html.Span("✅ Analysis complete! ", style={'color': COLORS['success']}),
-                    html.Span(f"Found {len(results['pairs'])} cointegrated pairs", style={'color': COLORS['text']})
+                    html.Span(f"Found {len(results['pairs'])} cointegrated pairs from {results['metadata'].get('total_pairs_tested', 0)} tested pairs", style={'color': COLORS['text']})
                 ])
                 
                 return status_msg, options, 0
             else:
                 status_msg = html.Div([
                     html.Span("⚠️ No cointegrated pairs found. ", style={'color': COLORS['warning']}),
-                    html.Span("Try adjusting parameters or date range.", style={'color': COLORS['text']})
+                    html.Span(f"Tested {results['metadata'].get('total_pairs_tested', 0)} pairs. Try adjusting parameters.", style={'color': COLORS['text']})
                 ])
                 return status_msg, [], None
         else:
@@ -1245,6 +1332,7 @@ def run_analysis(n_clicks, start_date, end_date, alpha, cluster_size):
             html.Span("❌ Error: ", style={'color': COLORS['error']}),
             html.Span(str(e), style={'color': COLORS['text']})
         ])
+        logger.error(f"Error in run_analysis callback: {e}")
         return error_msg, [], None
 
 @app.callback(
